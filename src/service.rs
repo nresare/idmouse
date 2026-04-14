@@ -1,35 +1,19 @@
-use crate::config::{LoadedConfig, UserConfig};
+use crate::config::{LoadedConfig, MappingConfig};
 use crate::error::AppError;
 use axum::http::{header, HeaderMap};
 use base64::Engine;
-use jsonwebtoken::{encode, Header};
+use jsonwebtoken::{decode, encode, Header, Validation};
 use p256::ecdsa::VerifyingKey;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+const TOKEN_TTL_SECONDS: u64 = 600;
 
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<LoadedConfig>,
-    pub token_reviewer: Arc<KubernetesTokenReviewer>,
-}
-
-#[derive(Clone)]
-pub struct KubernetesTokenReviewer {
-    api_url: String,
-    reviewer_token: String,
-    client: reqwest::Client,
-    audiences: Vec<String>,
-}
-
-#[derive(Debug, Clone)]
-pub struct ReviewedIdentity {
-    pub username: String,
-    pub uid: Option<String>,
-    pub groups: Vec<String>,
-    pub extra: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -37,8 +21,8 @@ pub struct TokenResponse {
     pub access_token: String,
     pub token_type: &'static str,
     pub expires_in: u64,
-    pub issued_subject: String,
-    pub kubernetes_username: String,
+    pub mapping: String,
+    pub source_subject: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -63,195 +47,77 @@ pub struct Jwk {
     pub y: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct SourceClaims {
+    sub: String,
+}
+
 #[derive(Debug, Serialize)]
-struct SurrealClaims {
+struct IssuedClaims {
     exp: u64,
     iat: u64,
     nbf: u64,
-    ac: String,
-    ns: String,
-    db: String,
-    sub: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    id: Option<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    rl: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    iss: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    aud: Option<String>,
+    iss: String,
     #[serde(flatten)]
     extra: Map<String, Value>,
 }
 
-#[derive(Debug, Serialize)]
-struct TokenReviewRequest<'a> {
-    #[serde(rename = "apiVersion")]
-    api_version: &'static str,
-    kind: &'static str,
-    spec: TokenReviewSpec<'a>,
-}
-
-#[derive(Debug, Serialize)]
-struct TokenReviewSpec<'a> {
-    token: &'a str,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    audiences: Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct TokenReviewResponse {
-    status: TokenReviewStatus,
-}
-
-#[derive(Debug, Deserialize)]
-struct TokenReviewStatus {
-    authenticated: Option<bool>,
-    user: Option<TokenReviewUser>,
-    error: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct TokenReviewUser {
-    username: String,
-    #[serde(default)]
-    uid: Option<String>,
-    #[serde(default)]
-    groups: Vec<String>,
-    #[serde(default)]
-    extra: BTreeMap<String, Vec<String>>,
-}
-
-impl KubernetesTokenReviewer {
-    pub fn from_config(config: &LoadedConfig) -> anyhow::Result<Self> {
-        let ca_bytes = std::fs::read(&config.kubernetes.ca_cert_file)?;
-        let reviewer_token = std::fs::read_to_string(&config.kubernetes.reviewer_token_file)?
-            .trim()
-            .to_string();
-        let client = reqwest::Client::builder()
-            .use_rustls_tls()
-            .add_root_certificate(reqwest::Certificate::from_pem(&ca_bytes)?)
-            .build()?;
-
-        Ok(Self {
-            api_url: config.kubernetes.api_url.clone(),
-            reviewer_token,
-            client,
-            audiences: config.kubernetes.audiences.clone(),
-        })
-    }
-
-    pub async fn review(&self, bearer_token: &str) -> Result<ReviewedIdentity, AppError> {
-        let request = TokenReviewRequest {
-            api_version: "authentication.k8s.io/v1",
-            kind: "TokenReview",
-            spec: TokenReviewSpec {
-                token: bearer_token,
-                audiences: self.audiences.clone(),
-            },
-        };
-
-        let response = self
-            .client
-            .post(format!(
-                "{}/apis/authentication.k8s.io/v1/tokenreviews",
-                self.api_url
-            ))
-            .bearer_auth(&self.reviewer_token)
-            .json(&request)
-            .send()
-            .await
-            .map_err(|e| {
-                AppError::Internal(format!("failed to call Kubernetes TokenReview API: {e}"))
-            })?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "<response body unavailable>".to_string());
-            return Err(AppError::Internal(format!(
-                "Kubernetes TokenReview API returned {status}: {body}"
-            )));
-        }
-
-        let review: TokenReviewResponse = response.json().await.map_err(|e| {
-            AppError::Internal(format!("failed to decode TokenReview response: {e}"))
-        })?;
-
-        if review.status.authenticated != Some(true) {
-            let detail = review
-                .status
-                .error
-                .unwrap_or_else(|| "token was not authenticated by Kubernetes".to_string());
-            return Err(AppError::Unauthorized(detail));
-        }
-
-        let user = review.status.user.ok_or_else(|| {
-            AppError::Internal(
-                "Kubernetes authenticated the token but returned no user".to_string(),
-            )
-        })?;
-
-        Ok(ReviewedIdentity {
-            username: user.username,
-            uid: user.uid,
-            groups: user.groups,
-            extra: user.extra,
-        })
-    }
-}
-
-pub async fn issue_token_from_headers(
+pub fn issue_token_from_headers(
     state: &AppState,
+    mapping_name: &str,
     headers: &HeaderMap,
 ) -> Result<TokenResponse, AppError> {
     let bearer_token = extract_bearer_token(headers)?;
-    let identity = state.token_reviewer.review(&bearer_token).await?;
-    issue_token_for_identity(state, identity)
+    let source_subject = authenticate_subject(state, &bearer_token)?;
+    let mapping = state
+        .config
+        .mappings
+        .get(mapping_name)
+        .ok_or_else(|| AppError::NotFound(format!("unknown mapping '{mapping_name}'")))?;
+
+    if !mapping
+        .allowed_subjects
+        .iter()
+        .any(|subject| subject == &source_subject)
+    {
+        return Err(AppError::Unauthorized(format!(
+            "subject '{source_subject}' is not allowed to use mapping '{mapping_name}'"
+        )));
+    }
+
+    issue_token_for_mapping(state, mapping, source_subject)
 }
 
-pub fn issue_token_for_identity(
+pub fn issue_token_for_mapping(
     state: &AppState,
-    identity: ReviewedIdentity,
+    mapping: &MappingConfig,
+    source_subject: String,
 ) -> Result<TokenResponse, AppError> {
-    let user = match_user(&state.config.users, &identity)?;
     let issued_at = now()?;
-    let ttl = user
-        .token_ttl_seconds
-        .unwrap_or(state.config.surreal.token_ttl_seconds);
     let expires_at = issued_at
-        .checked_add(ttl)
+        .checked_add(TOKEN_TTL_SECONDS)
         .ok_or_else(|| AppError::Internal("token expiration overflow".to_string()))?;
 
-    let mut header = Header::new(state.config.signing.algorithm);
+    let mut header = Header::new(jsonwebtoken::Algorithm::ES256);
     header.kid = Some(kid(state));
 
-    let claims = SurrealClaims {
+    let claims = IssuedClaims {
         exp: expires_at,
         iat: issued_at,
         nbf: issued_at,
-        ac: state.config.surreal.access_method.clone(),
-        ns: state.config.surreal.namespace.clone(),
-        db: state.config.surreal.database.clone(),
-        sub: user.subject.clone(),
-        id: Some(user.subject.clone()),
-        rl: user.surreal_roles.clone(),
-        iss: state.config.issuer.clone(),
-        aud: state.config.surreal.audience.clone(),
-        extra: extra_claims(user, &identity),
+        iss: state.config.origin.clone(),
+        extra: mapping.additional_claims.clone(),
     };
 
     let access_token = encode(&header, &claims, &state.config.signing.encoding_key)
-        .map_err(|e| AppError::Internal(format!("failed to encode surreal token: {e}")))?;
+        .map_err(|e| AppError::Internal(format!("failed to encode token: {e}")))?;
 
     Ok(TokenResponse {
         access_token,
         token_type: "Bearer",
-        expires_in: ttl,
-        issued_subject: user.subject.clone(),
-        kubernetes_username: identity.username,
+        expires_in: TOKEN_TTL_SECONDS,
+        mapping: mapping.name.clone(),
+        source_subject,
     })
 }
 
@@ -260,6 +126,21 @@ pub fn jwks(state: &AppState) -> JwksResponse {
     JwksResponse {
         keys: vec![build_jwk(&verifying_key, &kid(state))],
     }
+}
+
+fn authenticate_subject(state: &AppState, bearer_token: &str) -> Result<String, AppError> {
+    let mut validation = Validation::new(state.config.authentication.algorithm);
+    validation.set_audience(&[&state.config.authentication.audience]);
+    validation.set_issuer(&[&state.config.authentication.issuer]);
+
+    let decoded = decode::<SourceClaims>(
+        bearer_token,
+        &state.config.authentication.decoding_key,
+        &validation,
+    )
+    .map_err(|e| AppError::Unauthorized(format!("failed to validate source token: {e}")))?;
+
+    Ok(decoded.claims.sub)
 }
 
 fn extract_bearer_token(headers: &HeaderMap) -> Result<String, AppError> {
@@ -278,84 +159,6 @@ fn extract_bearer_token(headers: &HeaderMap) -> Result<String, AppError> {
     Ok(token.to_string())
 }
 
-fn match_user<'a>(
-    users: &'a [UserConfig],
-    identity: &ReviewedIdentity,
-) -> Result<&'a UserConfig, AppError> {
-    let matches = users
-        .iter()
-        .filter(|user| user_matches(user, identity))
-        .collect::<Vec<_>>();
-
-    match matches.as_slice() {
-        [] => Err(AppError::Unauthorized(format!(
-            "no configured user matched Kubernetes identity '{}'",
-            identity.username
-        ))),
-        [user] => Ok(*user),
-        _ => Err(AppError::Internal(format!(
-            "multiple configured users matched Kubernetes identity '{}'",
-            identity.username
-        ))),
-    }
-}
-
-fn user_matches(user: &UserConfig, identity: &ReviewedIdentity) -> bool {
-    let username_matches = if !user.kubernetes_usernames.is_empty() {
-        user.kubernetes_usernames
-            .iter()
-            .any(|candidate| candidate == &identity.username)
-    } else if user.kubernetes_groups.is_empty() {
-        user.subject == identity.username
-    } else {
-        true
-    };
-
-    let group_matches = if user.kubernetes_groups.is_empty() {
-        true
-    } else {
-        identity.groups.iter().any(|group| {
-            user.kubernetes_groups
-                .iter()
-                .any(|candidate| candidate == group)
-        })
-    };
-
-    username_matches && group_matches
-}
-
-fn extra_claims(user: &UserConfig, identity: &ReviewedIdentity) -> Map<String, Value> {
-    let mut claims = Map::new();
-    claims.insert(
-        "kubernetes_username".to_string(),
-        Value::String(identity.username.clone()),
-    );
-    if let Some(uid) = &identity.uid {
-        claims.insert("kubernetes_uid".to_string(), Value::String(uid.clone()));
-    }
-    if !identity.groups.is_empty() {
-        claims.insert(
-            "kubernetes_groups".to_string(),
-            Value::Array(identity.groups.iter().cloned().map(Value::String).collect()),
-        );
-    }
-    if !identity.extra.is_empty() {
-        let extra = identity
-            .extra
-            .iter()
-            .map(|(key, values)| {
-                (
-                    key.clone(),
-                    Value::Array(values.iter().cloned().map(Value::String).collect()),
-                )
-            })
-            .collect();
-        claims.insert("kubernetes_extra".to_string(), Value::Object(extra));
-    }
-    claims.extend(user.claims.clone());
-    claims
-}
-
 fn now() -> Result<u64, AppError> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -364,12 +167,8 @@ fn now() -> Result<u64, AppError> {
 }
 
 fn kid(state: &AppState) -> String {
-    state
-        .config
-        .signing
-        .key_id
-        .clone()
-        .unwrap_or_else(|| "idmouse".to_string())
+    let _ = state;
+    "idmouse".to_string()
 }
 
 fn build_jwk(verifying_key: &VerifyingKey, kid: &str) -> Jwk {
@@ -397,83 +196,103 @@ fn build_jwk(verifying_key: &VerifyingKey, kid: &str) -> Jwk {
 
 #[cfg(test)]
 mod tests {
-    use super::{issue_token_for_identity, jwks, AppState, ReviewedIdentity};
+    use super::{issue_token_for_mapping, issue_token_from_headers, jwks, AppState};
     use crate::config::Config;
-    use jsonwebtoken::{decode, DecodingKey, Validation};
+    use axum::http::{header, HeaderMap, HeaderValue};
+    use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
+    use serde::Serialize;
     use serde_json::json;
-    use std::collections::BTreeMap;
     use std::sync::Arc;
 
+    const SOURCE_PRIVATE_KEY: &str = r#"-----BEGIN PRIVATE KEY-----
+MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDhTPJsY5BW6Omc
+OftqnA1qKDVmifo0rOOws5g0/KBW7mmcQcoUuc0h0W668RXvG+Sm9XfCXp/jSkLN
+ST3gQaIwj4lnzMyaoTFjxBWWaQuNhbaxlm1nL2j9U9eaCxw0iUex0KDfbNUfjVHu
+KQwHkjHaUJ0ufQ/0xRScLtiCMLlcWjfbEFjoYhi69N1vekjboNL/ORAcbWAbsKGC
+Az0b3xM6L4d5pyO7enyBJWw8z/lGkVNJNQi1r3Zgs/Wf9AflzacypjX2lGbPkWcg
+kkyFmlHhk1MtzjlQoirIIt0N1PiRRD9HJJHuG4/ebPOJ7GndWapnKp8rngoZw7FH
+j11eMX+JAgMBAAECggEAb5U2c2wULpcILDGjTTeghTUIzZIEc1Y1JmysM4Hyv1sw
+vwzuUrl62Qbqundwj43W/sGP4JoQwfcjgpyFoq2e8EIGoXwS0XqIBYs1zdqUuDDD
+PMztvi8C5oRBwa9C9toOwgg7xKwYGZpaO4Pky1MikadfUYjrACUjgf7JiCEtjIjM
+KsmqJnzeIjHxtFyL/X2VNhmUWNQKPHYWe3zvBieshQPy7LLmYzzJGv7c9nyDJnPx
+mM7Tm4UTkjW/KSoED0kbfXmcJRJRNWo9P+tZ1ABJAx0V0cipbI+NDXqMhPGfPfTi
+08rJDae96+yPSu1c+cpFEFM7z2OMR403RouyVnMQoQKBgQD21y7eZmGqGrQ8O6wS
+UWM3+Ox6xTx+NsVBzNK8ypDqxWeVB7l38Taomm3FTHeE80lcd728MAmd66tcGGdb
+5SO5kgdvboLt9ZKvVBTMJbHVfXJHailZx2Qa5W8iigXfMIIQx3Xf0T5qauNb9mQj
+w3Fyf/ANPA4AZoNDkU579SwHfQKBgQDpqSYSwm5vzPjHY62m+npIk0Be3nOxkuQQ
+HUW+vlDFb5ZupW7CQGOQEuKvPcD6MZAddYvVbIObWnmkkHPhg6jZdp7bfXbd2yaf
+HGHJwvAYzCC5Hb4eQrVJZ/M8UzUcEBqXC4YmOTAnVMIV9qcEwVc7DasSIMiHLPAl
+oCVlE5vN/QKBgDiju69wkqxzoDPKBXvWjQvE5I5vP6g+bRjiJOEJIiOc1F3P/fDV
+upMJjHKfTzWElarQFwtdgndoIlPpjZ36gC4OogIhu41asiPlCTim1Z2FQXm9lGtz
+YzcAunWUcjB6cv3iptuKqeXFTRJHAUdri1aYoL6IrzXMUAZrCzVKVqYJAoGBALaA
+e1BjtMZ2Hkn+PQAS27gb60cuEMc9qAw+EN+u3n+XbLP3Ws82Y42AcrXVUgkY9StN
+SG7mVtTcke5LNXeK0jMoR2PAVztplHzqOibQr59usJBl/ry79cTkAEO56d2FZn9b
+bOgl+sp9lSp6gHFiYbOqNVfvazDJlLiOoSaVbjgxAoGATUH1geYvMl8W93MmA9vf
+bzyzl4KklDegSMtja84vVDt5nCYPO32q3VDbihuOAHKpEK+GWuGLRlNp0t8e1ih/
+KMueZKFHEwc6u9xKIEY3csS4Pbom5m0IU89tiZ22SzvWvGoMuwtJbFiGdMWFbyG+
+5XvOGTJeQmnvXyNmqhP9WSY=
+-----END PRIVATE KEY-----"#;
+
+    const SOURCE_PUBLIC_KEY: &str = r#"-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA4UzybGOQVujpnDn7apwN
+aig1Zon6NKzjsLOYNPygVu5pnEHKFLnNIdFuuvEV7xvkpvV3wl6f40pCzUk94EGi
+MI+JZ8zMmqExY8QVlmkLjYW2sZZtZy9o/VPXmgscNIlHsdCg32zVH41R7ikMB5Ix
+2lCdLn0P9MUUnC7YgjC5XFo32xBY6GIYuvTdb3pI26DS/zkQHG1gG7ChggM9G98T
+Oi+Heacju3p8gSVsPM/5RpFTSTUIta92YLP1n/QH5c2nMqY19pRmz5FnIJJMhZpR
+4ZNTLc45UKIqyCLdDdT4kUQ/RySR7huP3mzziexp3VmqZyqfK54KGcOxR49dXjF/
+iQIDAQAB
+-----END PUBLIC KEY-----"#;
+
+    #[derive(Serialize)]
+    struct SourceTokenClaims<'a> {
+        sub: &'a str,
+        iss: &'a str,
+        aud: &'a str,
+        exp: u64,
+        nbf: u64,
+        iat: u64,
+    }
+
     fn test_state() -> AppState {
-        let config: Config = toml::from_str(
+        let config_text = format!(
             r#"
 bind_address = "127.0.0.1:8080"
-issuer = "https://idmouse.default.svc.cluster.local"
+origin = "http://idmouse.idmouse.svc"
 
-[kubernetes]
-api_url = "https://kubernetes.default.svc"
-reviewer_token_file = "/tmp/reviewer-token"
-ca_cert_file = "/tmp/ca.crt"
-audiences = ["idmouse"]
-
-[surreal]
-access_method = "idmouse"
-namespace = "app"
-database = "main"
-token_ttl_seconds = 900
-audience = "surrealdb"
-
-[signing]
-algorithm = "ES256"
-key_id = "test-key"
-private_key_pem = """
------BEGIN PRIVATE KEY-----
-MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgN+6VmUXG/ef3u67r
-ATInaYskFnH49T8PsjkoXN2yDeqhRANCAAQaTpxRpVzE+CCkLWI9uVtIcez7yDmX
-iJSzcPn+34vupXwZBL8U/4mXcCbJbNaitEhq4SajOVtqk9WWsU7wJoWj
------END PRIVATE KEY-----
+[authentication]
+audience = "idmouse"
+issuer = "https://kubernetes.default.svc"
+validation_key = """
+{SOURCE_PUBLIC_KEY}
 """
 
-[[users]]
-subject = "alice"
-kubernetes_usernames = ["system:serviceaccount:team-a:alice"]
-surreal_roles = ["Editor"]
-claims = { email = "alice@example.com" }
-"#,
-        )
-        .unwrap();
+[[mapping]]
+name = "idelephant"
+allowed_subjects = ["system:serviceaccount:idelephant:idelephant"]
+additional_claims = {{ ns = "default", db = "idelephant", sub = "idelephant", ac = "token_name", id = "idelephant" }}
+
+"#
+        );
+        let config: Config = toml::from_str(&config_text).unwrap();
 
         AppState {
             config: Arc::new(config.validate().unwrap()),
-            token_reviewer: Arc::new(super::KubernetesTokenReviewer {
-                api_url: "https://kubernetes.default.svc".to_string(),
-                reviewer_token: "unused".to_string(),
-                client: reqwest::Client::new(),
-                audiences: vec!["idmouse".to_string()],
-            }),
         }
     }
 
     #[test]
-    fn issues_surreal_claims_for_kubernetes_identity() {
+    fn issues_mapping_claims() {
         let state = test_state();
-        let response = issue_token_for_identity(
+        let mapping = state.config.mappings.get("idelephant").unwrap();
+        let response = issue_token_for_mapping(
             &state,
-            ReviewedIdentity {
-                username: "system:serviceaccount:team-a:alice".to_string(),
-                uid: Some("uid-123".to_string()),
-                groups: vec![
-                    "system:serviceaccounts".to_string(),
-                    "system:serviceaccounts:team-a".to_string(),
-                ],
-                extra: BTreeMap::new(),
-            },
+            mapping,
+            "system:serviceaccount:idelephant:idelephant".to_string(),
         )
         .unwrap();
 
-        let mut validation = Validation::new(state.config.signing.algorithm);
-        validation.set_audience(&["surrealdb"]);
-        validation.set_issuer(&["https://idmouse.default.svc.cluster.local"]);
+        let mut validation = Validation::new(jsonwebtoken::Algorithm::ES256);
+        validation.set_issuer(&["http://idmouse.idmouse.svc"]);
 
         let decoded = decode::<serde_json::Value>(
             &response.access_token,
@@ -482,16 +301,45 @@ claims = { email = "alice@example.com" }
         )
         .unwrap();
 
-        assert_eq!(decoded.claims["ac"], json!("idmouse"));
-        assert_eq!(decoded.claims["ns"], json!("app"));
-        assert_eq!(decoded.claims["db"], json!("main"));
-        assert_eq!(decoded.claims["id"], json!("alice"));
-        assert_eq!(decoded.claims["rl"], json!(["Editor"]));
-        assert_eq!(
-            decoded.claims["kubernetes_username"],
-            json!("system:serviceaccount:team-a:alice")
-        );
-        assert_eq!(decoded.claims["email"], json!("alice@example.com"));
+        assert_eq!(decoded.claims["ns"], json!("default"));
+        assert_eq!(decoded.claims["db"], json!("idelephant"));
+        assert_eq!(decoded.claims["sub"], json!("idelephant"));
+        assert_eq!(decoded.claims["ac"], json!("token_name"));
+        assert_eq!(decoded.claims["id"], json!("idelephant"));
+    }
+
+    #[test]
+    fn authenticates_source_token_subject() {
+        let state = test_state();
+        let now = 4_102_444_800;
+        let token = encode(
+            &Header::new(jsonwebtoken::Algorithm::RS256),
+            &SourceTokenClaims {
+                sub: "system:serviceaccount:idelephant:idelephant",
+                iss: "https://kubernetes.default.svc",
+                aud: "idmouse",
+                exp: now + 60,
+                nbf: now - 60,
+                iat: now - 60,
+            },
+            &EncodingKey::from_rsa_pem(SOURCE_PRIVATE_KEY.as_bytes()).unwrap(),
+        )
+        .unwrap();
+
+        let mut headers = HeaderMap::new();
+        let header_value = HeaderValue::from_str(&format!("Bearer {token}")).unwrap();
+        headers.insert(header::AUTHORIZATION, header_value);
+
+        let response = issue_token_from_headers(&state, "idelephant", &headers).unwrap();
+        let mut validation = Validation::new(jsonwebtoken::Algorithm::ES256);
+        validation.set_issuer(&["http://idmouse.idmouse.svc"]);
+        let decoded = decode::<serde_json::Value>(
+            &response.access_token,
+            &DecodingKey::from_ec_pem(state.config.signing.public_key_pem.as_bytes()).unwrap(),
+            &validation,
+        )
+        .unwrap();
+        assert_eq!(decoded.claims["sub"], json!("idelephant"));
     }
 
     #[test]
@@ -500,6 +348,6 @@ claims = { email = "alice@example.com" }
         let jwks = jwks(&state);
         assert_eq!(jwks.keys.len(), 1);
         assert_eq!(jwks.keys[0].alg, "ES256");
-        assert_eq!(jwks.keys[0].kid, "test-key");
+        assert_eq!(jwks.keys[0].kid, "idmouse");
     }
 }

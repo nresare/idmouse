@@ -1,29 +1,27 @@
 bind_address = "0.0.0.0:8080"
-issuer = "https://idmouse.default.svc.cluster.local"
+origin = "http://idmouse.idmouse.svc"
 
-[kubernetes]
-audiences = ["idmouse"]
-
-[surreal]
-access_method = "idmouse"
-namespace = "app"
-database = "main"
-token_ttl_seconds = 3600
-audience = "surrealdb"
-
-[signing]
-algorithm = "ES256"
-key_id = "dev-key"
-private_key_pem = """
------BEGIN PRIVATE KEY-----
-MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgN+6VmUXG/ef3u67r
-ATInaYskFnH49T8PsjkoXN2yDeqhRANCAAQaTpxRpVzE+CCkLWI9uVtIcez7yDmX
-iJSzcPn+34vupXwZBL8U/4mXcCbJbNaitEhq4SajOVtqk9WWsU7wJoWj
------END PRIVATE KEY-----
+[authentication]
+audience = "idmouse"
+issuer = "https://kubernetes.default.svc"
+validation_key = """
+-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAoTljJr11MDnf6FGOXi07
+EUqrmLKrT/9tPEJd98zYCP+3oUaqvDDnq72wSWmwmztjxun4O4kotsuExhitnVQ5
+2p2W8fd/bgaw88G1Ud2FVe0k0BKTVZuh7jFlFaLCmzC4L+H3F3wuxVWW4KtoAW5W
+lRnmMR5fvsrANs2zhIF2sEme0Y+zS/kxaWLLniq9E+OvbRUtLEDnoiDOvei/diAY
+DXl7MVlwWE2RhaVnEHgMiIJbzpDGoSxYcpM0WbSX9OJp2vGt2y8wVJ4JKmkvEbLn
+QNomSRZMTkPmzXK+GjSJAw90ImP+lHXlzwyZUJq1h0hbE5BvxnmQi/NbwH9CSPWm
+HwIDAQAB
+-----END PUBLIC KEY-----
 """
 
-[[users]]
-subject = "alice"
-kubernetes_usernames = ["system:serviceaccount:team-a:alice"]
-surreal_roles = ["Editor"]
-claims = { email = "alice@example.com", team = "team-a" }
+[[mapping]]
+name = "idelephant"
+allowed_subjects = ["system:serviceaccount:idelephant:idelephant"]
+additional_claims = { ns = "default", db = "idelephant", sub = "idelephant", ac = "token_name", id = "idelephant" }
+
+[[mapping]]
+name = "some_other_mapping"
+allowed_subjects = ["system:serviceaccount:default:default"]
+additional_claims = { ns = "ns_name", db = "foo" }

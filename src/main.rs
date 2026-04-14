@@ -5,10 +5,9 @@ mod service;
 use crate::config::Config;
 use crate::error::AppError;
 use crate::service::{
-    issue_token_from_headers, jwks, AppState, HealthResponse, JwksResponse,
-    KubernetesTokenReviewer, TokenResponse,
+    issue_token_from_headers, jwks, AppState, HealthResponse, JwksResponse, TokenResponse,
 };
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::HeaderMap;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -54,16 +53,14 @@ async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let config = Config::load(&cli.config_path)?.validate()?;
     let bind_address: SocketAddr = config.bind_address.parse()?;
-    let token_reviewer = KubernetesTokenReviewer::from_config(&config)?;
 
     let state = AppState {
         config: Arc::new(config),
-        token_reviewer: Arc::new(token_reviewer),
     };
 
     let app = Router::new()
         .route("/healthz", get(healthz))
-        .route("/token", post(token))
+        .route("/token/{name}", post(token))
         .route("/.well-known/jwks.json", get(jwks_handler))
         .layer(
             TraceLayer::new_for_http()
@@ -83,10 +80,11 @@ async fn healthz() -> Json<HealthResponse> {
 }
 
 async fn token(
+    Path(name): Path<String>,
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<TokenResponse>, AppError> {
-    Ok(Json(issue_token_from_headers(&state, &headers).await?))
+    Ok(Json(issue_token_from_headers(&state, &name, &headers)?))
 }
 
 async fn jwks_handler(State(state): State<AppState>) -> Json<JwksResponse> {

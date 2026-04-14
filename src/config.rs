@@ -1,7 +1,8 @@
 use anyhow::Context;
-use jsonwebtoken::{Algorithm, EncodingKey};
+use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey};
 use p256::ecdsa::{SigningKey, VerifyingKey};
-use p256::pkcs8::{DecodePrivateKey, EncodePublicKey, LineEnding};
+use p256::elliptic_curve::rand_core::OsRng;
+use p256::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
 use serde::Deserialize;
 use serde_json::{Map, Value};
 use std::collections::HashMap;
@@ -10,87 +11,49 @@ use std::collections::HashMap;
 pub struct Config {
     #[serde(default = "default_bind_address")]
     pub bind_address: String,
-    #[serde(default)]
-    pub issuer: Option<String>,
-    pub kubernetes: KubernetesConfig,
-    pub surreal: SurrealConfig,
-    pub signing: SigningConfig,
-    #[serde(default)]
-    pub users: Vec<UserConfig>,
+    pub origin: String,
+    pub authentication: AuthenticationConfig,
+    #[serde(rename = "mapping", default)]
+    pub mappings: Vec<MappingConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct KubernetesConfig {
-    #[serde(default)]
-    pub api_url: Option<String>,
-    #[serde(default)]
-    pub reviewer_token_file: Option<String>,
-    #[serde(default)]
-    pub ca_cert_file: Option<String>,
-    #[serde(default)]
-    pub audiences: Vec<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct SurrealConfig {
-    pub access_method: String,
-    pub namespace: String,
-    pub database: String,
-    #[serde(default = "default_token_ttl_seconds")]
-    pub token_ttl_seconds: u64,
-    #[serde(default)]
-    pub audience: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct SigningConfig {
-    #[serde(default = "default_signing_algorithm")]
+pub struct AuthenticationConfig {
+    pub audience: String,
+    pub issuer: String,
+    pub validation_key: String,
+    #[serde(default = "default_authentication_algorithm")]
     pub algorithm: String,
-    #[serde(default)]
-    pub key_id: Option<String>,
-    #[serde(default)]
-    pub private_key_pem: Option<String>,
-    #[serde(default)]
-    pub private_key_file: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct UserConfig {
-    pub subject: String,
+pub struct MappingConfig {
+    pub name: String,
     #[serde(default)]
-    pub kubernetes_usernames: Vec<String>,
+    pub allowed_subjects: Vec<String>,
     #[serde(default)]
-    pub kubernetes_groups: Vec<String>,
-    #[serde(default)]
-    pub surreal_roles: Vec<String>,
-    #[serde(default)]
-    pub claims: Map<String, Value>,
-    #[serde(default)]
-    pub token_ttl_seconds: Option<u64>,
+    pub additional_claims: Map<String, Value>,
 }
 
 #[derive(Clone)]
 pub struct LoadedConfig {
     pub bind_address: String,
-    pub issuer: Option<String>,
-    pub kubernetes: LoadedKubernetesConfig,
-    pub surreal: SurrealConfig,
-    pub signing: LoadedSigningConfig,
-    pub users: Vec<UserConfig>,
-}
-
-#[derive(Debug, Clone)]
-pub struct LoadedKubernetesConfig {
-    pub api_url: String,
-    pub reviewer_token_file: String,
-    pub ca_cert_file: String,
-    pub audiences: Vec<String>,
+    pub origin: String,
+    pub authentication: LoadedAuthenticationConfig,
+    pub mappings: HashMap<String, MappingConfig>,
+    pub signing: SigningState,
 }
 
 #[derive(Clone)]
-pub struct LoadedSigningConfig {
+pub struct LoadedAuthenticationConfig {
+    pub audience: String,
+    pub issuer: String,
     pub algorithm: Algorithm,
-    pub key_id: Option<String>,
+    pub decoding_key: DecodingKey,
+}
+
+#[derive(Clone)]
+pub struct SigningState {
     pub encoding_key: EncodingKey,
     pub signing_key: SigningKey,
     pub public_key_pem: String,
@@ -104,131 +67,106 @@ impl Config {
     }
 
     pub fn validate(self) -> anyhow::Result<LoadedConfig> {
-        if self.users.is_empty() {
-            anyhow::bail!("at least one [[users]] entry is required");
+        if self.origin.is_empty() {
+            anyhow::bail!("origin must not be empty");
+        }
+        if self.mappings.is_empty() {
+            anyhow::bail!("at least one [[mapping]] entry is required");
         }
 
-        let mut subjects = HashMap::new();
-        for user in &self.users {
-            if user.subject.is_empty() {
-                anyhow::bail!("user subjects must not be empty");
+        let mut mappings = HashMap::new();
+        for mapping in self.mappings {
+            if mapping.name.is_empty() {
+                anyhow::bail!("mapping names must not be empty");
             }
-            if subjects.insert(user.subject.clone(), ()).is_some() {
-                anyhow::bail!("duplicate user subject '{}'", user.subject);
+            if mapping.allowed_subjects.is_empty() {
+                anyhow::bail!(
+                    "mapping '{}' must define at least one allowed_subject",
+                    mapping.name
+                );
             }
-            for role in &user.surreal_roles {
-                if !matches!(role.as_str(), "Viewer" | "Editor" | "Owner") {
-                    anyhow::bail!(
-                        "user '{}' has unsupported surreal role '{}'; expected Viewer, Editor or Owner",
-                        user.subject,
-                        role
-                    );
-                }
+            let mapping_name = mapping.name.clone();
+            if mappings.insert(mapping_name.clone(), mapping).is_some() {
+                anyhow::bail!("duplicate mapping name '{mapping_name}'");
             }
-        }
-
-        if self.surreal.access_method.is_empty() {
-            anyhow::bail!("surreal.access_method must not be empty");
-        }
-        if self.surreal.namespace.is_empty() {
-            anyhow::bail!("surreal.namespace must not be empty");
-        }
-        if self.surreal.database.is_empty() {
-            anyhow::bail!("surreal.database must not be empty");
         }
 
         Ok(LoadedConfig {
             bind_address: self.bind_address,
-            issuer: self.issuer,
-            kubernetes: self.kubernetes.validate()?,
-            surreal: self.surreal,
-            signing: self.signing.validate()?,
-            users: self.users,
+            origin: self.origin,
+            authentication: self.authentication.validate()?,
+            mappings,
+            signing: build_signing_state()?,
         })
     }
 }
 
-impl KubernetesConfig {
-    fn validate(self) -> anyhow::Result<LoadedKubernetesConfig> {
-        let api_url = match self.api_url {
-            Some(api_url) => api_url,
-            None => kube_api_url_from_env()?,
+impl AuthenticationConfig {
+    fn validate(self) -> anyhow::Result<LoadedAuthenticationConfig> {
+        if self.audience.is_empty() {
+            anyhow::bail!("authentication.audience must not be empty");
+        }
+        if self.issuer.is_empty() {
+            anyhow::bail!("authentication.issuer must not be empty");
+        }
+        let algorithm = parse_authentication_algorithm(&self.algorithm)?;
+        let decoding_key = match algorithm {
+            Algorithm::RS256 | Algorithm::RS384 | Algorithm::RS512 => {
+                DecodingKey::from_rsa_pem(self.validation_key.as_bytes())
+                    .context("failed to parse RSA validation key")?
+            }
+            Algorithm::ES256 | Algorithm::ES384 => {
+                DecodingKey::from_ec_pem(self.validation_key.as_bytes())
+                    .context("failed to parse EC validation key")?
+            }
+            other => anyhow::bail!("unsupported authentication algorithm '{other:?}'"),
         };
 
-        Ok(LoadedKubernetesConfig {
-            api_url,
-            reviewer_token_file: self.reviewer_token_file.unwrap_or_else(|| {
-                "/var/run/secrets/kubernetes.io/serviceaccount/token".to_string()
-            }),
-            ca_cert_file: self.ca_cert_file.unwrap_or_else(|| {
-                "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt".to_string()
-            }),
-            audiences: self.audiences,
-        })
-    }
-}
-
-impl SigningConfig {
-    fn validate(self) -> anyhow::Result<LoadedSigningConfig> {
-        let algorithm = parse_algorithm(&self.algorithm)?;
-        let private_key_pem = load_private_key(&self)?;
-        let signing_key = SigningKey::from_pkcs8_pem(&private_key_pem)
-            .context("failed to parse ES256 private key")?;
-        let verifying_key = VerifyingKey::from(&signing_key);
-        let public_key_pem = verifying_key
-            .to_public_key_pem(LineEnding::LF)
-            .context("failed to encode ES256 public key")?;
-        let encoding_key = EncodingKey::from_ec_pem(private_key_pem.as_bytes())
-            .context("failed to create JWT encoding key from ES256 private key")?;
-
-        Ok(LoadedSigningConfig {
+        Ok(LoadedAuthenticationConfig {
+            audience: self.audience,
+            issuer: self.issuer,
             algorithm,
-            key_id: self.key_id,
-            encoding_key,
-            signing_key,
-            public_key_pem,
+            decoding_key,
         })
     }
 }
 
-fn load_private_key(config: &SigningConfig) -> anyhow::Result<String> {
-    match (&config.private_key_pem, &config.private_key_file) {
-        (Some(pem), None) => Ok(pem.clone()),
-        (None, Some(path)) => std::fs::read_to_string(path)
-            .with_context(|| format!("Could not read private key file '{path}'")),
-        (Some(_), Some(_)) => anyhow::bail!(
-            "configure only one of signing.private_key_pem or signing.private_key_file"
-        ),
-        (None, None) => {
-            anyhow::bail!("one of signing.private_key_pem or signing.private_key_file is required")
-        }
-    }
-}
-
-fn parse_algorithm(value: &str) -> anyhow::Result<Algorithm> {
+fn parse_authentication_algorithm(value: &str) -> anyhow::Result<Algorithm> {
     match value {
+        "RS256" => Ok(Algorithm::RS256),
+        "RS384" => Ok(Algorithm::RS384),
+        "RS512" => Ok(Algorithm::RS512),
         "ES256" => Ok(Algorithm::ES256),
-        other => anyhow::bail!("unsupported signing algorithm '{other}'; only ES256 is supported"),
+        "ES384" => Ok(Algorithm::ES384),
+        other => anyhow::bail!(
+            "unsupported authentication algorithm '{other}'; supported values are RS256, RS384, RS512, ES256 and ES384"
+        ),
     }
-}
-
-fn kube_api_url_from_env() -> anyhow::Result<String> {
-    let host = std::env::var("KUBERNETES_SERVICE_HOST")
-        .context("KUBERNETES_SERVICE_HOST is not set and kubernetes.api_url was not configured")?;
-    let port = std::env::var("KUBERNETES_SERVICE_PORT_HTTPS")
-        .or_else(|_| std::env::var("KUBERNETES_SERVICE_PORT"))
-        .unwrap_or_else(|_| "443".to_string());
-    Ok(format!("https://{host}:{port}"))
 }
 
 fn default_bind_address() -> String {
     "0.0.0.0:8080".to_string()
 }
 
-fn default_token_ttl_seconds() -> u64 {
-    3600
+fn default_authentication_algorithm() -> String {
+    "RS256".to_string()
 }
 
-fn default_signing_algorithm() -> String {
-    "ES256".to_string()
+fn build_signing_state() -> anyhow::Result<SigningState> {
+    let signing_key = SigningKey::random(&mut OsRng);
+    let verifying_key = VerifyingKey::from(&signing_key);
+    let private_key_pem = signing_key
+        .to_pkcs8_pem(LineEnding::LF)
+        .context("failed to encode generated ES256 private key")?;
+    let public_key_pem = verifying_key
+        .to_public_key_pem(LineEnding::LF)
+        .context("failed to encode ES256 public key")?;
+    let encoding_key = EncodingKey::from_ec_pem(private_key_pem.as_bytes())
+        .context("failed to create JWT encoding key from ES256 private key")?;
+
+    Ok(SigningState {
+        encoding_key,
+        signing_key,
+        public_key_pem,
+    })
 }

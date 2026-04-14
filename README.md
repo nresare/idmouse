@@ -1,112 +1,82 @@
 # idmouse
 
-`idmouse` is a Rust service built with Axum for exchanging Kubernetes-issued bearer tokens into
-SurrealDB authentication tokens.
+`idmouse` is a Rust service built with Axum for exchanging an authenticated incoming JWT into a
+new JWT selected by a named mapping.
 
-It is intended to run inside a Kubernetes cluster:
+The config defines:
 
-- callers present a cluster-issued JWT to `idmouse`
-- `idmouse` asks the Kubernetes API server to authenticate that token via `TokenReview`
-- the resulting Kubernetes identity is matched against TOML-configured user rules
-- `idmouse` issues a SurrealDB-ready JWT containing the claims required by `DEFINE ACCESS ... TYPE JWT`
+- how incoming bearer tokens should be authenticated
+- a list of named mappings
 
-## Why this shape
+## Request flow
 
-Kubernetes service account tokens already identify workloads as usernames like
-`system:serviceaccount:<namespace>:<name>`. `idmouse` turns that cluster identity into a smaller,
-purpose-built token for SurrealDB.
-
-SurrealDB expects JWTs used with `DEFINE ACCESS ... TYPE JWT` on a database to contain at least:
-
-- `exp`
-- `ac`
-- `ns`
-- `db`
-
-It also understands optional claims like `id`, `nbf`, and `rl`.
-
-## Running locally
-
-Start the service with:
-
-```bash
-cargo run -- -c ./idmouse.toml
-```
-
-Then request a SurrealDB token by sending a Kubernetes bearer token:
-
-```bash
-curl -s http://127.0.0.1:8080/token \
-  -H "Authorization: Bearer $KUBE_TOKEN"
-```
-
-The JWKS for SurrealDB lives at:
-
-```text
-http://127.0.0.1:8080/.well-known/jwks.json
-```
+1. Call `POST /token/<mapping-name>` with an `Authorization: Bearer ...` header.
+2. `idmouse` validates the incoming token using the configured authentication issuer, audience, and
+   validation key.
+3. The incoming token subject must be present in the mapping’s `allowed_subjects`.
+4. `idmouse` issues a new JWT containing standard timing claims plus the mapping’s
+   `additional_claims`.
 
 ## Example config
 
 ```toml
 bind_address = "0.0.0.0:8080"
-issuer = "https://idmouse.default.svc.cluster.local"
+origin = "http://idmouse.idmouse.svc"
 
-[kubernetes]
-audiences = ["idmouse"]
-
-[surreal]
-access_method = "idmouse"
-namespace = "app"
-database = "main"
-token_ttl_seconds = 3600
-audience = "surrealdb"
-
-[signing]
-algorithm = "ES256"
-key_id = "dev-key"
-private_key_pem = """
------BEGIN PRIVATE KEY-----
-MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgN+6VmUXG/ef3u67r
-ATInaYskFnH49T8PsjkoXN2yDeqhRANCAAQaTpxRpVzE+CCkLWI9uVtIcez7yDmX
-iJSzcPn+34vupXwZBL8U/4mXcCbJbNaitEhq4SajOVtqk9WWsU7wJoWj
------END PRIVATE KEY-----
+[authentication]
+audience = "idmouse"
+issuer = "https://kubernetes.default.svc"
+validation_key = """
+-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAoTljJr11MDnf6FGOXi07
+EUqrmLKrT/9tPEJd98zYCP+3oUaqvDDnq72wSWmwmztjxun4O4kotsuExhitnVQ5
+2p2W8fd/bgaw88G1Ud2FVe0k0BKTVZuh7jFlFaLCmzC4L+H3F3wuxVWW4KtoAW5W
+lRnmMR5fvsrANs2zhIF2sEme0Y+zS/kxaWLLniq9E+OvbRUtLEDnoiDOvei/diAY
+DXl7MVlwWE2RhaVnEHgMiIJbzpDGoSxYcpM0WbSX9OJp2vGt2y8wVJ4JKmkvEbLn
+QNomSRZMTkPmzXK+GjSJAw90ImP+lHXlzwyZUJq1h0hbE5BvxnmQi/NbwH9CSPWm
+HwIDAQAB
+-----END PUBLIC KEY-----
 """
 
-[[users]]
-subject = "alice"
-kubernetes_usernames = ["system:serviceaccount:team-a:alice"]
-surreal_roles = ["Editor"]
-claims = { email = "alice@example.com", team = "team-a" }
+[[mapping]]
+name = "idelephant"
+allowed_subjects = ["system:serviceaccount:idelephant:idelephant"]
+additional_claims = { ns = "default", db = "idelephant", sub = "idelephant", ac = "token_name", id = "idelephant" }
+
+[[mapping]]
+name = "some_other_mapping"
+allowed_subjects = ["system:serviceaccount:default:default"]
+additional_claims = { ns = "ns_name", db = "foo" }
 ```
 
-## Matching rules
+## Endpoints
 
-- If `kubernetes_usernames` is set, the Kubernetes username must match one of them.
-- If `kubernetes_groups` is set, the reviewed identity must belong to at least one of them.
-- If neither is set, `subject` is matched directly against the Kubernetes username.
-- If more than one user rule matches, the request is rejected.
+- `GET /healthz`
+- `GET /.well-known/jwks.json`
+- `POST /token/<mapping-name>`
 
-## SurrealDB setup
+Example:
 
-Configure SurrealDB to trust `idmouse` through JWKS:
-
-```sql
-USE NS app DB main;
-
-DEFINE ACCESS idmouse ON DATABASE TYPE JWT
-  URL "https://idmouse.default.svc.cluster.local/.well-known/jwks.json"
-  AUTHENTICATE {
-    IF $token.iss != "https://idmouse.default.svc.cluster.local" {
-      THROW "Invalid token issuer"
-    };
-    IF $token.aud IS NOT "surrealdb" {
-      THROW "Invalid token audience"
-    };
-  };
+```bash
+curl -s http://127.0.0.1:8080/token/idelephant \
+  -H "Authorization: Bearer $SOURCE_TOKEN"
 ```
 
-## Kubernetes permissions
+## Issued claims
 
-`idmouse` needs permission to create `tokenreviews.authentication.k8s.io`, because it asks the API
-server to validate presented bearer tokens.
+Every issued token includes:
+
+- `exp`
+- `iat`
+- `nbf`
+- `iss`
+
+It also includes every key from the selected mapping’s `additional_claims`.
+Issued tokens are always valid for 10 minutes.
+Issued tokens are always signed with ephemeral P-256 / `ES256` keys.
+
+## Temporary signing behavior
+
+For now, `idmouse` generates a fresh ES256 signing key each time it starts. That keeps private key
+material out of the config file, but it also means previously issued tokens stop verifying after a
+restart because the JWKS changes with each new process.
