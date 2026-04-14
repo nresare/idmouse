@@ -1,0 +1,29 @@
+bind_address = "0.0.0.0:8080"
+issuer = "https://idmouse.default.svc.cluster.local"
+
+[kubernetes]
+audiences = ["idmouse"]
+
+[surreal]
+access_method = "idmouse"
+namespace = "app"
+database = "main"
+token_ttl_seconds = 3600
+audience = "surrealdb"
+
+[signing]
+algorithm = "ES256"
+key_id = "dev-key"
+private_key_pem = """
+-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgN+6VmUXG/ef3u67r
+ATInaYskFnH49T8PsjkoXN2yDeqhRANCAAQaTpxRpVzE+CCkLWI9uVtIcez7yDmX
+iJSzcPn+34vupXwZBL8U/4mXcCbJbNaitEhq4SajOVtqk9WWsU7wJoWj
+-----END PRIVATE KEY-----
+"""
+
+[[users]]
+subject = "alice"
+kubernetes_usernames = ["system:serviceaccount:team-a:alice"]
+surreal_roles = ["Editor"]
+claims = { email = "alice@example.com", team = "team-a" }
