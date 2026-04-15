@@ -24,7 +24,6 @@ pub struct AppState {
 pub struct SigningState {
     pub encoding_key: EncodingKey,
     pub signing_key: SigningKey,
-    pub public_key_pem: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -79,7 +78,7 @@ pub fn build_signing_state() -> anyhow::Result<SigningState> {
     let private_key_pem = signing_key
         .to_pkcs8_pem(LineEnding::LF)
         .context("failed to encode generated ES256 private key")?;
-    let public_key_pem = verifying_key
+    let _ = verifying_key
         .to_public_key_pem(LineEnding::LF)
         .context("failed to encode ES256 public key")?;
     let encoding_key = EncodingKey::from_ec_pem(private_key_pem.as_bytes())
@@ -88,7 +87,6 @@ pub fn build_signing_state() -> anyhow::Result<SigningState> {
     Ok(SigningState {
         encoding_key,
         signing_key,
-        public_key_pem,
     })
 }
 
@@ -230,6 +228,8 @@ mod tests {
     use crate::config::Config;
     use axum::http::{header, HeaderMap, HeaderValue};
     use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
+    use p256::ecdsa::VerifyingKey;
+    use p256::pkcs8::{EncodePublicKey, LineEnding};
     use serde::Serialize;
     use serde_json::json;
     use std::sync::Arc;
@@ -312,6 +312,12 @@ additional_claims = {{ ns = "default", db = "idelephant", sub = "idelephant", ac
         }
     }
 
+    fn public_key_pem(state: &AppState) -> String {
+        VerifyingKey::from(&state.signing.signing_key)
+            .to_public_key_pem(LineEnding::LF)
+            .unwrap()
+    }
+
     #[test]
     fn issues_mapping_claims() {
         let state = test_state();
@@ -328,7 +334,7 @@ additional_claims = {{ ns = "default", db = "idelephant", sub = "idelephant", ac
 
         let decoded = decode::<serde_json::Value>(
             &response.access_token,
-            &DecodingKey::from_ec_pem(state.signing.public_key_pem.as_bytes()).unwrap(),
+            &DecodingKey::from_ec_pem(public_key_pem(&state).as_bytes()).unwrap(),
             &validation,
         )
         .unwrap();
@@ -367,7 +373,7 @@ additional_claims = {{ ns = "default", db = "idelephant", sub = "idelephant", ac
         validation.set_issuer(&["http://idmouse.idmouse.svc"]);
         let decoded = decode::<serde_json::Value>(
             &response.access_token,
-            &DecodingKey::from_ec_pem(state.signing.public_key_pem.as_bytes()).unwrap(),
+            &DecodingKey::from_ec_pem(public_key_pem(&state).as_bytes()).unwrap(),
             &validation,
         )
         .unwrap();
