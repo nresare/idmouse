@@ -28,7 +28,7 @@ struct Cli {
         name = "config-file",
         short = 'c',
         long = "config-file",
-        default_value = "/etc/idmouse.toml"
+        default_value = "/config/idmouse.toml"
     )]
     config_path: String,
 }

@@ -1,14 +1,17 @@
 steps:
-  - commands:
+  - label: ':rust: rust build and test'
+    env:
+      RUSTFLAGS: -Dwarnings
+    commands:
       - cargo fmt --check
-      - cargo clippy --workspace --locked
+      - cargo clippy --workspace --locked --all-targets
       - cargo test --workspace --locked
     key: rust_test
-    label: ':rust: rust build and test'
-  - agents:
+  - label: ':whale: build docker image'
+    if: build.branch == "main"
+    agents:
       arch: arm64
     command: docker buildx build -t idmouse:latest .
-    label: ':whale: build docker image'
     plugins:
       - docker-image-push#v1.1.0:
           buildkite:
