@@ -22,6 +22,8 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
 
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 #[derive(Parser)]
 struct Cli {
     #[arg(
@@ -55,6 +57,8 @@ async fn run() -> anyhow::Result<()> {
     let config = Config::load(&cli.config_path)?;
     config.validate()?;
     let bind_address: SocketAddr = config.bind_address.parse()?;
+
+    info!(version = VERSION, config_path = %cli.config_path, "starting idmouse");
 
     let state = AppState {
         config: Arc::new(config),
