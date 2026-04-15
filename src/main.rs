@@ -5,7 +5,8 @@ mod service;
 use crate::config::Config;
 use crate::error::AppError;
 use crate::service::{
-    issue_token_from_headers, jwks, AppState, HealthResponse, JwksResponse, TokenResponse,
+    build_signing_state, issue_token_from_headers, jwks, AppState, HealthResponse, JwksResponse,
+    TokenResponse,
 };
 use axum::extract::{Path, State};
 use axum::http::HeaderMap;
@@ -51,11 +52,13 @@ async fn main() -> anyhow::Result<()> {
 
 async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let config = Config::load(&cli.config_path)?.validate()?;
+    let config = Config::load(&cli.config_path)?;
+    config.validate()?;
     let bind_address: SocketAddr = config.bind_address.parse()?;
 
     let state = AppState {
         config: Arc::new(config),
+        signing: Arc::new(build_signing_state()?),
     };
 
     let app = Router::new()

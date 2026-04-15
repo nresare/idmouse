@@ -1,0 +1,18 @@
+steps:
+  - commands:
+      - cargo fmt --check
+      - cargo clippy --workspace --locked
+      - cargo test --workspace --locked
+    key: rust_test
+    label: ':rust: rust build and test'
+  - agents:
+      arch: arm64
+    command: docker buildx build -t idmouse:latest .
+    label: ':whale: build docker image'
+    plugins:
+      - docker-image-push#v1.1.0:
+          buildkite:
+            auth-method: oidc
+          image: idmouse
+          provider: buildkite
+          tag: latest

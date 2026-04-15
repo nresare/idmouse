@@ -1,9 +1,12 @@
-use crate::config::{LoadedConfig, MappingConfig};
+use crate::config::{Config, MappingConfig};
 use crate::error::AppError;
+use anyhow::Context;
 use axum::http::{header, HeaderMap};
 use base64::Engine;
-use jsonwebtoken::{decode, encode, Header, Validation};
-use p256::ecdsa::VerifyingKey;
+use jsonwebtoken::{decode, encode, EncodingKey, Header, Validation};
+use p256::ecdsa::{SigningKey, VerifyingKey};
+use p256::elliptic_curve::rand_core::OsRng;
+use p256::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::sync::Arc;
@@ -13,7 +16,15 @@ const TOKEN_TTL_SECONDS: u64 = 600;
 
 #[derive(Clone)]
 pub struct AppState {
-    pub config: Arc<LoadedConfig>,
+    pub config: Arc<Config>,
+    pub signing: Arc<SigningState>,
+}
+
+#[derive(Clone)]
+pub struct SigningState {
+    pub encoding_key: EncodingKey,
+    pub signing_key: SigningKey,
+    pub public_key_pem: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -62,6 +73,25 @@ struct IssuedClaims {
     extra: Map<String, Value>,
 }
 
+pub fn build_signing_state() -> anyhow::Result<SigningState> {
+    let signing_key = SigningKey::random(&mut OsRng);
+    let verifying_key = VerifyingKey::from(&signing_key);
+    let private_key_pem = signing_key
+        .to_pkcs8_pem(LineEnding::LF)
+        .context("failed to encode generated ES256 private key")?;
+    let public_key_pem = verifying_key
+        .to_public_key_pem(LineEnding::LF)
+        .context("failed to encode ES256 public key")?;
+    let encoding_key = EncodingKey::from_ec_pem(private_key_pem.as_bytes())
+        .context("failed to create JWT encoding key from ES256 private key")?;
+
+    Ok(SigningState {
+        encoding_key,
+        signing_key,
+        public_key_pem,
+    })
+}
+
 pub fn issue_token_from_headers(
     state: &AppState,
     mapping_name: &str,
@@ -71,8 +101,7 @@ pub fn issue_token_from_headers(
     let source_subject = authenticate_subject(state, &bearer_token)?;
     let mapping = state
         .config
-        .mappings
-        .get(mapping_name)
+        .mapping(mapping_name)
         .ok_or_else(|| AppError::NotFound(format!("unknown mapping '{mapping_name}'")))?;
 
     if !mapping
@@ -99,7 +128,7 @@ pub fn issue_token_for_mapping(
         .ok_or_else(|| AppError::Internal("token expiration overflow".to_string()))?;
 
     let mut header = Header::new(jsonwebtoken::Algorithm::ES256);
-    header.kid = Some(kid(state));
+    header.kid = Some(kid());
 
     let claims = IssuedClaims {
         exp: expires_at,
@@ -109,7 +138,7 @@ pub fn issue_token_for_mapping(
         extra: mapping.additional_claims.clone(),
     };
 
-    let access_token = encode(&header, &claims, &state.config.signing.encoding_key)
+    let access_token = encode(&header, &claims, &state.signing.encoding_key)
         .map_err(|e| AppError::Internal(format!("failed to encode token: {e}")))?;
 
     Ok(TokenResponse {
@@ -122,20 +151,20 @@ pub fn issue_token_for_mapping(
 }
 
 pub fn jwks(state: &AppState) -> JwksResponse {
-    let verifying_key = VerifyingKey::from(&state.config.signing.signing_key);
+    let verifying_key = VerifyingKey::from(&state.signing.signing_key);
     JwksResponse {
-        keys: vec![build_jwk(&verifying_key, &kid(state))],
+        keys: vec![build_jwk(&verifying_key, &kid())],
     }
 }
 
 fn authenticate_subject(state: &AppState, bearer_token: &str) -> Result<String, AppError> {
-    let mut validation = Validation::new(state.config.authentication.algorithm);
+    let mut validation = Validation::new(state.config.authentication.algorithm()?);
     validation.set_audience(&[&state.config.authentication.audience]);
     validation.set_issuer(&[&state.config.authentication.issuer]);
 
     let decoded = decode::<SourceClaims>(
         bearer_token,
-        &state.config.authentication.decoding_key,
+        &state.config.authentication.decoding_key()?,
         &validation,
     )
     .map_err(|e| AppError::Unauthorized(format!("failed to validate source token: {e}")))?;
@@ -166,8 +195,7 @@ fn now() -> Result<u64, AppError> {
         .map_err(|e| AppError::Internal(format!("system time error: {e}")))
 }
 
-fn kid(state: &AppState) -> String {
-    let _ = state;
+fn kid() -> String {
     "idmouse".to_string()
 }
 
@@ -196,7 +224,9 @@ fn build_jwk(verifying_key: &VerifyingKey, kid: &str) -> Jwk {
 
 #[cfg(test)]
 mod tests {
-    use super::{issue_token_for_mapping, issue_token_from_headers, jwks, AppState};
+    use super::{
+        build_signing_state, issue_token_for_mapping, issue_token_from_headers, jwks, AppState,
+    };
     use crate::config::Config;
     use axum::http::{header, HeaderMap, HeaderValue};
     use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
@@ -274,16 +304,18 @@ additional_claims = {{ ns = "default", db = "idelephant", sub = "idelephant", ac
 "#
         );
         let config: Config = toml::from_str(&config_text).unwrap();
+        config.validate().unwrap();
 
         AppState {
-            config: Arc::new(config.validate().unwrap()),
+            config: Arc::new(config),
+            signing: Arc::new(build_signing_state().unwrap()),
         }
     }
 
     #[test]
     fn issues_mapping_claims() {
         let state = test_state();
-        let mapping = state.config.mappings.get("idelephant").unwrap();
+        let mapping = state.config.mapping("idelephant").unwrap();
         let response = issue_token_for_mapping(
             &state,
             mapping,
@@ -296,7 +328,7 @@ additional_claims = {{ ns = "default", db = "idelephant", sub = "idelephant", ac
 
         let decoded = decode::<serde_json::Value>(
             &response.access_token,
-            &DecodingKey::from_ec_pem(state.config.signing.public_key_pem.as_bytes()).unwrap(),
+            &DecodingKey::from_ec_pem(state.signing.public_key_pem.as_bytes()).unwrap(),
             &validation,
         )
         .unwrap();
@@ -335,7 +367,7 @@ additional_claims = {{ ns = "default", db = "idelephant", sub = "idelephant", ac
         validation.set_issuer(&["http://idmouse.idmouse.svc"]);
         let decoded = decode::<serde_json::Value>(
             &response.access_token,
-            &DecodingKey::from_ec_pem(state.config.signing.public_key_pem.as_bytes()).unwrap(),
+            &DecodingKey::from_ec_pem(state.signing.public_key_pem.as_bytes()).unwrap(),
             &validation,
         )
         .unwrap();
