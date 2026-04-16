@@ -45,7 +45,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     if let Err(error) = run().await {
-        error!("{error}");
+        error!("{error:#}");
         std::process::exit(1);
     }
 

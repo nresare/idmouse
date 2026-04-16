@@ -159,10 +159,15 @@ fn authenticate_subject(state: &AppState, bearer_token: &str) -> Result<String, 
     let mut validation = Validation::new(state.config.authentication.algorithm()?);
     validation.set_audience(&[&state.config.authentication.audience]);
     validation.set_issuer(&[&state.config.authentication.issuer]);
+    let decoding_key = state
+        .config
+        .authentication
+        .resolving_decoding_key(bearer_token)
+        .map_err(AppError::from)?;
 
     let decoded = decode::<SourceClaims>(
         bearer_token,
-        &state.config.authentication.decoding_key()?,
+        &decoding_key,
         &validation,
     )
     .map_err(|e| AppError::Unauthorized(format!("failed to validate source token: {e}")))?;

@@ -12,7 +12,10 @@ The config defines:
 
 1. Call `POST /token/<mapping-name>` with an `Authorization: Bearer ...` header.
 2. `idmouse` validates the incoming token using the configured authentication issuer, audience, and
-   validation key.
+   validation key when one is configured.
+   If `validation_key` is omitted, `idmouse` fetches
+   `<issuer>/.well-known/openid-configuration`, reads `jwks_uri`, and then discovers a matching
+   verification key from that JWKS document.
 3. The incoming token subject must be present in the mapping’s `allowed_subjects`.
 4. `idmouse` issues a new JWT containing standard timing claims plus the mapping’s
    `additional_claims`.
@@ -37,6 +40,9 @@ QNomSRZMTkPmzXK+GjSJAw90ImP+lHXlzwyZUJq1h0hbE5BvxnmQi/NbwH9CSPWm
 HwIDAQAB
 -----END PUBLIC KEY-----
 """
+
+# Optional. If omitted, idmouse will attempt OpenID Connect discovery via
+# <issuer>/.well-known/openid-configuration and use the returned jwks_uri.
 
 [[mapping]]
 name = "idelephant"
