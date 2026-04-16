@@ -16,6 +16,9 @@ The config defines:
    If `validation_key` is omitted, `idmouse` fetches
    `<issuer>/.well-known/openid-configuration`, reads `jwks_uri`, and then discovers a matching
    verification key from that JWKS document.
+   For the exact issuer `https://kubernetes.default.svc`, discovery also uses the service account
+   CA bundle and bearer token from `/var/run/secrets/kubernetes.io/serviceaccount/` when those
+   files exist.
 3. The incoming token subject must be present in the mapping’s `allowed_subjects`.
 4. `idmouse` issues a new JWT containing standard timing claims plus the mapping’s
    `additional_claims`.
