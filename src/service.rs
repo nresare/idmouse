@@ -1,3 +1,4 @@
+use crate::auth;
 use crate::config::{Config, MappingConfig};
 use crate::error::AppError;
 use anyhow::Context;
@@ -156,21 +157,14 @@ pub fn jwks(state: &AppState) -> JwksResponse {
 }
 
 fn authenticate_subject(state: &AppState, bearer_token: &str) -> Result<String, AppError> {
-    let mut validation = Validation::new(state.config.authentication.algorithm()?);
+    let mut validation = Validation::new(auth::algorithm(&state.config.authentication)?);
     validation.set_audience(&[&state.config.authentication.audience]);
     validation.set_issuer(&[&state.config.authentication.issuer]);
-    let decoding_key = state
-        .config
-        .authentication
-        .resolving_decoding_key(bearer_token)
+    let decoding_key = auth::resolving_decoding_key(&state.config.authentication, bearer_token)
         .map_err(AppError::from)?;
 
-    let decoded = decode::<SourceClaims>(
-        bearer_token,
-        &decoding_key,
-        &validation,
-    )
-    .map_err(|e| AppError::Unauthorized(format!("failed to validate source token: {e}")))?;
+    let decoded = decode::<SourceClaims>(bearer_token, &decoding_key, &validation)
+        .map_err(|e| AppError::Unauthorized(format!("failed to validate source token: {e}")))?;
 
     Ok(decoded.claims.sub)
 }
