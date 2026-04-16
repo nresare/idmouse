@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tracing::debug;
 
 const TOKEN_TTL_SECONDS: u64 = 600;
 
@@ -157,14 +158,25 @@ pub fn jwks(state: &AppState) -> JwksResponse {
 }
 
 fn authenticate_subject(state: &AppState, bearer_token: &str) -> Result<String, AppError> {
-    let mut validation = Validation::new(auth::algorithm(&state.config.authentication)?);
+    let algorithm = auth::algorithm(&state.config.authentication)?;
+    debug!(
+        issuer = %state.config.authentication.issuer,
+        audience = %state.config.authentication.audience,
+        algorithm = ?algorithm,
+        "preparing source token validation"
+    );
+    let mut validation = Validation::new(algorithm);
     validation.set_audience(&[&state.config.authentication.audience]);
     validation.set_issuer(&[&state.config.authentication.issuer]);
+    debug!("resolving decoding key for source token validation");
     let decoding_key = auth::resolving_decoding_key(&state.config.authentication, bearer_token)
         .map_err(AppError::from)?;
+    debug!("resolved decoding key for source token validation");
 
+    debug!("validating source token signature and claims");
     let decoded = decode::<SourceClaims>(bearer_token, &decoding_key, &validation)
         .map_err(|e| AppError::Unauthorized(format!("failed to validate source token: {e}")))?;
+    debug!(subject = %decoded.claims.sub, "source token validation succeeded");
 
     Ok(decoded.claims.sub)
 }

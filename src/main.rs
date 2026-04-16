@@ -40,7 +40,7 @@ struct Cli {
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::registry()
         .with(EnvFilter::new(
-            "idmouse=info,tower_http=info,axum::rejection=trace",
+            "idmouse=debug,tower_http=info,axum::rejection=trace",
         ))
         .with(tracing_subscriber::fmt::layer().compact())
         .init();

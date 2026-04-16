@@ -5,6 +5,7 @@ use jsonwebtoken::{decode_header, Algorithm, DecodingKey};
 use reqwest::blocking::{Client, ClientBuilder};
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use serde::Deserialize;
+use tracing::{debug, info};
 
 const KUBERNETES_ISSUER: &str = "https://kubernetes.default.svc";
 const KUBERNETES_CA_CERT_PATH: &str = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt";
@@ -44,7 +45,13 @@ pub fn resolving_decoding_key(
 ) -> anyhow::Result<DecodingKey> {
     match authentication.validation_key {
         Some(_) => decoding_key(authentication),
-        None => discovery_decoding_key(authentication, bearer_token),
+        None => {
+            info!(
+                issuer = %authentication.issuer,
+                "authentication.validation_key not configured; attempting issuer-based validation key discovery"
+            );
+            discovery_decoding_key(authentication, bearer_token)
+        }
     }
 }
 
@@ -55,6 +62,11 @@ fn discovery_decoding_key(
     let openid_configuration_url = format!(
         "{}/.well-known/openid-configuration",
         authentication.issuer.trim_end_matches('/')
+    );
+    debug!(
+        issuer = %authentication.issuer,
+        openid_configuration_url = %openid_configuration_url,
+        "fetching OpenID configuration for validation key discovery"
     );
     let client = discovery_client(authentication)?;
 
@@ -74,7 +86,15 @@ fn discovery_decoding_key(
         .with_context(|| {
             format!("failed to parse OpenID configuration from '{openid_configuration_url}'")
         })?;
+    debug!(
+        jwks_uri = %openid_configuration.jwks_uri,
+        "fetched OpenID configuration for validation key discovery"
+    );
 
+    debug!(
+        jwks_uri = %openid_configuration.jwks_uri,
+        "fetching JWKS for validation key discovery"
+    );
     let jwks: JwkSet = client
         .get(&openid_configuration.jwks_uri)
         .send()
@@ -98,21 +118,32 @@ fn discovery_decoding_key(
                 openid_configuration.jwks_uri
             )
         })?;
+    debug!(
+        jwks_key_count = jwks.keys.len(),
+        "fetched JWKS for validation key discovery"
+    );
 
     let header = decode_header(bearer_token)
         .context("failed to decode bearer token header for key discovery")?;
+    debug!(token_kid = ?header.kid, "decoded bearer token header for validation key discovery");
     let jwk = select_jwk_for_token(&jwks, &header.kid, algorithm(authentication)?)?;
 
-    DecodingKey::from_jwk(jwk).with_context(|| {
+    let decoding_key = DecodingKey::from_jwk(jwk).with_context(|| {
         let key_id = jwk.common.key_id.as_deref().unwrap_or("<no kid>");
         format!("failed to construct decoding key from discovered JWK '{key_id}'")
-    })
+    })?;
+    debug!(
+        discovered_jwk_kid = ?jwk.common.key_id,
+        "constructed decoding key from discovered JWK"
+    );
+    Ok(decoding_key)
 }
 
 fn discovery_client(authentication: &AuthenticationConfig) -> anyhow::Result<Client> {
     let mut builder = Client::builder();
 
     if authentication.issuer == KUBERNETES_ISSUER {
+        debug!("configuring Kubernetes-specific HTTP client settings for validation key discovery");
         builder = configure_kubernetes_discovery_client(builder)?;
     }
 
@@ -202,6 +233,15 @@ fn configure_kubernetes_discovery_client(
             )
         })?;
         builder = builder.add_root_certificate(certificate);
+        debug!(
+            ca_cert_path = KUBERNETES_CA_CERT_PATH,
+            "configured Kubernetes CA bundle"
+        );
+    } else {
+        debug!(
+            ca_cert_path = KUBERNETES_CA_CERT_PATH,
+            "Kubernetes CA bundle not found"
+        );
     }
 
     if let Ok(service_account_token) = std::fs::read_to_string(KUBERNETES_TOKEN_PATH) {
@@ -215,7 +255,16 @@ fn configure_kubernetes_discovery_client(
             })?;
             headers.insert(AUTHORIZATION, header_value);
             builder = builder.default_headers(headers);
+            debug!(
+                token_path = KUBERNETES_TOKEN_PATH,
+                "configured Kubernetes service account bearer token for discovery requests"
+            );
         }
+    } else {
+        debug!(
+            token_path = KUBERNETES_TOKEN_PATH,
+            "Kubernetes service account token not found"
+        );
     }
 
     Ok(builder)
