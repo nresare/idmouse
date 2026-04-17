@@ -1,15 +1,11 @@
 use crate::config::AuthenticationConfig;
+use crate::kubernetes;
 use anyhow::Context;
 use jsonwebtoken::jwk::{Jwk, JwkSet, KeyAlgorithm, PublicKeyUse};
 use jsonwebtoken::{decode_header, Algorithm, DecodingKey};
-use reqwest::blocking::{Client, ClientBuilder};
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
+use reqwest::blocking::Client;
 use serde::Deserialize;
 use tracing::{debug, info};
-
-const KUBERNETES_ISSUER: &str = "https://kubernetes.default.svc";
-const KUBERNETES_CA_CERT_PATH: &str = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt";
-const KUBERNETES_TOKEN_PATH: &str = "/var/run/secrets/kubernetes.io/serviceaccount/token";
 
 pub fn algorithm(authentication: &AuthenticationConfig) -> anyhow::Result<Algorithm> {
     match authentication.algorithm.as_str() {
@@ -142,9 +138,9 @@ fn discovery_decoding_key(
 fn discovery_client(authentication: &AuthenticationConfig) -> anyhow::Result<Client> {
     let mut builder = Client::builder();
 
-    if authentication.issuer == KUBERNETES_ISSUER {
+    if authentication.issuer == kubernetes::KUBERNETES_SERVICE_HOST {
         debug!("configuring Kubernetes-specific HTTP client settings for validation key discovery");
-        builder = configure_kubernetes_discovery_client(builder)?;
+        builder = kubernetes::configure_in_cluster_client(builder)?;
     }
 
     builder
@@ -221,51 +217,4 @@ fn jwk_matches_algorithm(jwk: &Jwk, algorithm: Algorithm) -> bool {
         }
         _ => false,
     }
-}
-
-fn configure_kubernetes_discovery_client(
-    mut builder: ClientBuilder,
-) -> anyhow::Result<ClientBuilder> {
-    if let Ok(ca_cert_pem) = std::fs::read(KUBERNETES_CA_CERT_PATH) {
-        let certificate = reqwest::Certificate::from_pem(&ca_cert_pem).with_context(|| {
-            format!(
-                "failed to parse Kubernetes CA certificate bundle at '{KUBERNETES_CA_CERT_PATH}'"
-            )
-        })?;
-        builder = builder.add_root_certificate(certificate);
-        debug!(
-            ca_cert_path = KUBERNETES_CA_CERT_PATH,
-            "configured Kubernetes CA bundle"
-        );
-    } else {
-        debug!(
-            ca_cert_path = KUBERNETES_CA_CERT_PATH,
-            "Kubernetes CA bundle not found"
-        );
-    }
-
-    if let Ok(service_account_token) = std::fs::read_to_string(KUBERNETES_TOKEN_PATH) {
-        let token = service_account_token.trim();
-        if !token.is_empty() {
-            let mut headers = HeaderMap::new();
-            let header_value = HeaderValue::from_str(&format!("Bearer {token}")).with_context(|| {
-                format!(
-                    "failed to build Authorization header from Kubernetes token at '{KUBERNETES_TOKEN_PATH}'"
-                )
-            })?;
-            headers.insert(AUTHORIZATION, header_value);
-            builder = builder.default_headers(headers);
-            debug!(
-                token_path = KUBERNETES_TOKEN_PATH,
-                "configured Kubernetes service account bearer token for discovery requests"
-            );
-        }
-    } else {
-        debug!(
-            token_path = KUBERNETES_TOKEN_PATH,
-            "Kubernetes service account token not found"
-        );
-    }
-
-    Ok(builder)
 }

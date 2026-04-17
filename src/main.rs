@@ -1,7 +1,9 @@
 mod auth;
 mod config;
 mod error;
+mod kubernetes;
 mod service;
+mod signing;
 
 use crate::config::Config;
 use crate::error::AppError;
@@ -61,9 +63,10 @@ async fn run() -> anyhow::Result<()> {
 
     info!(version = VERSION, config_path = %cli.config_path, "starting idmouse");
 
+    let signing = build_signing_state(&config)?;
     let state = AppState {
         config: Arc::new(config),
-        signing: Arc::new(build_signing_state()?),
+        signing: Arc::new(signing),
     };
 
     let app = Router::new()
@@ -95,6 +98,6 @@ async fn token(
     Ok(Json(issue_token_from_headers(&state, &name, &headers)?))
 }
 
-async fn jwks_handler(State(state): State<AppState>) -> Json<JwksResponse> {
-    Json(jwks(&state))
+async fn jwks_handler(State(state): State<AppState>) -> Result<Json<JwksResponse>, AppError> {
+    Ok(Json(jwks(&state)?))
 }
