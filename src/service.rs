@@ -1,30 +1,29 @@
 use crate::auth;
-use crate::config::{Config, MappingConfig};
+use crate::config::{AuthenticationConfig, Config, MappingConfig};
 use crate::error::AppError;
-use crate::signing::{SigningRequest, SigningState};
-use axum::http::{header, HeaderMap};
-use chrono::Utc;
+use crate::signing::{build_signing_backend, SigningBackend};
 use jsonwebtoken::{decode, Validation};
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::debug;
-
-const TOKEN_TTL_SECONDS: u64 = 600;
 
 #[derive(Clone)]
 pub struct AppState {
-    pub config: Arc<Config>,
-    pub signing: Arc<SigningState>,
+    pub subject_validator: Arc<SubjectValidator>,
+    pub mapping_resolver: Arc<MappingResolver>,
+    pub token_signer: Arc<dyn SigningBackend>,
 }
 
-#[derive(Debug, Serialize)]
-pub struct TokenResponse {
-    pub access_token: String,
-    pub token_type: &'static str,
-    pub expires_in: u64,
-    pub mapping: String,
-    pub source_subject: String,
+#[derive(Clone)]
+pub struct SubjectValidator {
+    authentication: AuthenticationConfig,
+}
+
+#[derive(Clone)]
+pub struct MappingResolver {
+    origin: String,
+    mappings: Arc<Vec<MappingConfig>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -54,131 +53,98 @@ struct SourceClaims {
     sub: String,
 }
 
-pub fn build_signing_state(config: &Config) -> anyhow::Result<SigningState> {
-    SigningState::build(config)
-}
-
-pub fn issue_token_from_headers(
-    state: &AppState,
-    mapping_name: &str,
-    headers: &HeaderMap,
-) -> Result<TokenResponse, AppError> {
-    let bearer_token = extract_bearer_token(headers)?;
-    let source_subject = authenticate_subject(state, &bearer_token)?;
-    let mapping = state
-        .config
-        .mapping(mapping_name)
-        .ok_or_else(|| AppError::NotFound(format!("unknown mapping '{mapping_name}'")))?;
-
-    if !mapping
-        .allowed_subjects
-        .iter()
-        .any(|subject| subject == &source_subject)
-    {
-        return Err(AppError::Unauthorized(format!(
-            "subject '{source_subject}' is not allowed to use mapping '{mapping_name}'"
-        )));
-    }
-
-    issue_token_for_mapping(state, mapping, source_subject)
-}
-
-pub fn issue_token_for_mapping(
-    state: &AppState,
-    mapping: &MappingConfig,
-    source_subject: String,
-) -> Result<TokenResponse, AppError> {
-    let issued_at = now()?;
-    let expires_at = issued_at
-        .checked_add(TOKEN_TTL_SECONDS)
-        .ok_or_else(|| AppError::Internal("token expiration overflow".to_string()))?;
-    let request = SigningRequest {
-        expires_at,
-        issued_at,
-        issuer: state.config.origin.clone(),
-        extra: mapping.additional_claims.clone(),
-    };
-
-    let access_token = state
-        .signing
-        .sign(&request, Utc::now())
-        .map_err(AppError::from)?;
-
-    Ok(TokenResponse {
-        access_token,
-        token_type: "Bearer",
-        expires_in: TOKEN_TTL_SECONDS,
-        mapping: mapping.name.clone(),
-        source_subject,
+pub fn build_app_state(config: Config) -> anyhow::Result<AppState> {
+    Ok(AppState {
+        subject_validator: Arc::new(SubjectValidator::new(config.authentication.clone())),
+        mapping_resolver: Arc::new(MappingResolver::new(
+            config.origin.clone(),
+            config.mappings.clone(),
+        )),
+        token_signer: build_signing_backend(&config)?,
     })
 }
 
-pub fn jwks(state: &AppState) -> Result<JwksResponse, AppError> {
-    Ok(JwksResponse {
-        keys: state.signing.jwks(Utc::now()).map_err(AppError::from)?,
-    })
-}
-
-fn authenticate_subject(state: &AppState, bearer_token: &str) -> Result<String, AppError> {
-    let algorithm = auth::algorithm(&state.config.authentication)?;
-    debug!(
-        issuer = %state.config.authentication.issuer,
-        audience = %state.config.authentication.audience,
-        algorithm = ?algorithm,
-        "preparing source token validation"
-    );
-    let mut validation = Validation::new(algorithm);
-    validation.set_audience(&[&state.config.authentication.audience]);
-    validation.set_issuer(&[&state.config.authentication.issuer]);
-    debug!("resolving decoding key for source token validation");
-    let decoding_key = auth::resolving_decoding_key(&state.config.authentication, bearer_token)
-        .map_err(AppError::from)?;
-    debug!("resolved decoding key for source token validation");
-
-    debug!("validating source token signature and claims");
-    let decoded = decode::<SourceClaims>(bearer_token, &decoding_key, &validation)
-        .map_err(|e| AppError::Unauthorized(format!("failed to validate source token: {e}")))?;
-    debug!(subject = %decoded.claims.sub, "source token validation succeeded");
-
-    Ok(decoded.claims.sub)
-}
-
-fn extract_bearer_token(headers: &HeaderMap) -> Result<String, AppError> {
-    let value = headers
-        .get(header::AUTHORIZATION)
-        .ok_or_else(|| AppError::Unauthorized("missing Authorization header".to_string()))?;
-    let value = value
-        .to_str()
-        .map_err(|_| AppError::Unauthorized("invalid Authorization header".to_string()))?;
-    let token = value
-        .strip_prefix("Bearer ")
-        .ok_or_else(|| AppError::Unauthorized("expected a Bearer token".to_string()))?;
-    if token.is_empty() {
-        return Err(AppError::Unauthorized("empty bearer token".to_string()));
+impl SubjectValidator {
+    pub fn new(authentication: AuthenticationConfig) -> Self {
+        Self { authentication }
     }
-    Ok(token.to_string())
+
+    pub fn validate(&self, bearer_token: &str) -> Result<String, AppError> {
+        let algorithm = auth::algorithm(&self.authentication)?;
+        debug!(
+            issuer = %self.authentication.issuer,
+            audience = %self.authentication.audience,
+            algorithm = ?algorithm,
+            "preparing source token validation"
+        );
+        let mut validation = Validation::new(algorithm);
+        validation.set_audience(&[&self.authentication.audience]);
+        validation.set_issuer(&[&self.authentication.issuer]);
+        debug!("resolving decoding key for source token validation");
+        let decoding_key = auth::resolving_decoding_key(&self.authentication, bearer_token)
+            .map_err(AppError::from)?;
+        debug!("resolved decoding key for source token validation");
+
+        debug!("validating source token signature and claims");
+        let decoded = decode::<SourceClaims>(bearer_token, &decoding_key, &validation)
+            .map_err(|e| AppError::Unauthorized(format!("failed to validate source token: {e}")))?;
+        debug!(subject = %decoded.claims.sub, "source token validation succeeded");
+
+        Ok(decoded.claims.sub)
+    }
 }
 
-fn now() -> Result<u64, AppError> {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .map_err(|e| AppError::Internal(format!("system time error: {e}")))
+impl MappingResolver {
+    pub fn new(origin: String, mappings: Vec<MappingConfig>) -> Self {
+        Self {
+            origin,
+            mappings: Arc::new(mappings),
+        }
+    }
+
+    pub fn resolve(
+        &self,
+        mapping_name: &str,
+        subject: &str,
+    ) -> Result<Map<String, Value>, AppError> {
+        let mapping = self
+            .mappings
+            .iter()
+            .find(|mapping| mapping.name == mapping_name)
+            .ok_or_else(|| AppError::NotFound(format!("unknown mapping '{mapping_name}'")))?;
+
+        if !mapping
+            .allowed_subjects
+            .iter()
+            .any(|allowed_subject| allowed_subject == subject)
+        {
+            return Err(AppError::Unauthorized(format!(
+                "subject '{subject}' is not allowed to use mapping '{mapping_name}'"
+            )));
+        }
+
+        let mut claims = mapping.additional_claims.clone();
+        claims.insert("iss".to_string(), Value::String(self.origin.clone()));
+        Ok(claims)
+    }
+}
+
+impl AppState {
+    pub fn jwks(&self) -> Result<JwksResponse, AppError> {
+        Ok(JwksResponse {
+            keys: self.token_signer.jwks().map_err(AppError::from)?,
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        build_signing_state, issue_token_for_mapping, issue_token_from_headers, jwks, AppState,
-    };
+    use super::{build_app_state, AppState};
     use crate::config::Config;
-    use axum::http::{header, HeaderMap, HeaderValue};
-    use chrono::Utc;
     use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
     use p256::pkcs8::EncodePublicKey;
     use serde::Serialize;
-    use serde_json::json;
-    use std::sync::Arc;
+    use serde_json::{json, Map, Value};
 
     const SOURCE_PRIVATE_KEY: &str = r#"-----BEGIN PRIVATE KEY-----
 MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDhTPJsY5BW6Omc
@@ -251,17 +217,13 @@ additional_claims = {{ ns = "default", db = "idelephant", sub = "idelephant", ac
         );
         let config: Config = toml::from_str(&config_text).unwrap();
         config.validate().unwrap();
-
-        AppState {
-            signing: Arc::new(build_signing_state(&config).unwrap()),
-            config: Arc::new(config),
-        }
+        build_app_state(config).unwrap()
     }
 
     fn public_key_pem(state: &AppState) -> String {
         let jwk = state
-            .signing
-            .jwks(Utc::now())
+            .token_signer
+            .jwks()
             .unwrap()
             .into_iter()
             .next()
@@ -271,22 +233,31 @@ additional_claims = {{ ns = "default", db = "idelephant", sub = "idelephant", ac
         pem.to_public_key_pem(p256::pkcs8::LineEnding::LF).unwrap()
     }
 
+    fn finalize_claims(mut claims: Map<String, Value>) -> Map<String, Value> {
+        let issued_at = 4_102_444_800_u64;
+        claims.insert("iat".to_string(), Value::from(issued_at));
+        claims.insert("nbf".to_string(), Value::from(issued_at));
+        claims.insert(
+            "exp".to_string(),
+            Value::from(issued_at + crate::signing::TOKEN_TTL_SECONDS),
+        );
+        claims
+    }
+
     #[test]
     fn issues_mapping_claims() {
         let state = test_state();
-        let mapping = state.config.mapping("idelephant").unwrap();
-        let response = issue_token_for_mapping(
-            &state,
-            mapping,
-            "system:serviceaccount:idelephant:idelephant".to_string(),
-        )
-        .unwrap();
+        let claims = state
+            .mapping_resolver
+            .resolve("idelephant", "system:serviceaccount:idelephant:idelephant")
+            .unwrap();
+        let access_token = state.token_signer.sign(&finalize_claims(claims)).unwrap();
 
         let mut validation = Validation::new(jsonwebtoken::Algorithm::ES256);
         validation.set_issuer(&["http://idmouse.idmouse.svc"]);
 
         let decoded = decode::<serde_json::Value>(
-            &response.access_token,
+            &access_token,
             &DecodingKey::from_ec_pem(public_key_pem(&state).as_bytes()).unwrap(),
             &validation,
         )
@@ -317,15 +288,16 @@ additional_claims = {{ ns = "default", db = "idelephant", sub = "idelephant", ac
         )
         .unwrap();
 
-        let mut headers = HeaderMap::new();
-        let header_value = HeaderValue::from_str(&format!("Bearer {token}")).unwrap();
-        headers.insert(header::AUTHORIZATION, header_value);
-
-        let response = issue_token_from_headers(&state, "idelephant", &headers).unwrap();
+        let subject = state.subject_validator.validate(&token).unwrap();
+        let claims = state
+            .mapping_resolver
+            .resolve("idelephant", &subject)
+            .unwrap();
+        let access_token = state.token_signer.sign(&finalize_claims(claims)).unwrap();
         let mut validation = Validation::new(jsonwebtoken::Algorithm::ES256);
         validation.set_issuer(&["http://idmouse.idmouse.svc"]);
         let decoded = decode::<serde_json::Value>(
-            &response.access_token,
+            &access_token,
             &DecodingKey::from_ec_pem(public_key_pem(&state).as_bytes()).unwrap(),
             &validation,
         )
@@ -336,9 +308,9 @@ additional_claims = {{ ns = "default", db = "idelephant", sub = "idelephant", ac
     #[test]
     fn publishes_ec_jwks() {
         let state = test_state();
-        let jwks = jwks(&state).unwrap();
-        assert_eq!(jwks.keys.len(), 1);
-        assert_eq!(jwks.keys[0].alg, "ES256");
-        assert_eq!(jwks.keys[0].kid, "idmouse");
+        let jwks = state.token_signer.jwks().unwrap();
+        assert_eq!(jwks.len(), 1);
+        assert_eq!(jwks[0].alg, "ES256");
+        assert_eq!(jwks[0].kid, "idmouse");
     }
 }

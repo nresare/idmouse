@@ -75,10 +75,6 @@ impl Config {
         self.authentication.validate()?;
         Ok(())
     }
-
-    pub fn mapping(&self, name: &str) -> Option<&MappingConfig> {
-        self.mappings.iter().find(|mapping| mapping.name == name)
-    }
 }
 
 impl AuthenticationConfig {
