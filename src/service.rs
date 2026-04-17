@@ -1,13 +1,10 @@
 use crate::auth;
 use crate::config::{Config, MappingConfig};
 use crate::error::AppError;
-use anyhow::Context;
+use crate::signing::SigningState;
 use axum::http::{header, HeaderMap};
-use base64::Engine;
-use jsonwebtoken::{decode, encode, EncodingKey, Header, Validation};
-use p256::ecdsa::{SigningKey, VerifyingKey};
-use p256::elliptic_curve::rand_core::OsRng;
-use p256::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
+use chrono::Utc;
+use jsonwebtoken::{decode, encode, Header, Validation};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::sync::Arc;
@@ -20,12 +17,6 @@ const TOKEN_TTL_SECONDS: u64 = 600;
 pub struct AppState {
     pub config: Arc<Config>,
     pub signing: Arc<SigningState>,
-}
-
-#[derive(Clone)]
-pub struct SigningState {
-    pub encoding_key: EncodingKey,
-    pub signing_key: SigningKey,
 }
 
 #[derive(Debug, Serialize)]
@@ -47,7 +38,7 @@ pub struct JwksResponse {
     pub keys: Vec<Jwk>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Jwk {
     pub kty: String,
     pub crv: String,
@@ -74,22 +65,8 @@ struct IssuedClaims {
     extra: Map<String, Value>,
 }
 
-pub fn build_signing_state() -> anyhow::Result<SigningState> {
-    let signing_key = SigningKey::random(&mut OsRng);
-    let verifying_key = VerifyingKey::from(&signing_key);
-    let private_key_pem = signing_key
-        .to_pkcs8_pem(LineEnding::LF)
-        .context("failed to encode generated ES256 private key")?;
-    let _ = verifying_key
-        .to_public_key_pem(LineEnding::LF)
-        .context("failed to encode ES256 public key")?;
-    let encoding_key = EncodingKey::from_ec_pem(private_key_pem.as_bytes())
-        .context("failed to create JWT encoding key from ES256 private key")?;
-
-    Ok(SigningState {
-        encoding_key,
-        signing_key,
-    })
+pub fn build_signing_state(config: &Config) -> anyhow::Result<SigningState> {
+    SigningState::build(config)
 }
 
 pub fn issue_token_from_headers(
@@ -126,9 +103,13 @@ pub fn issue_token_for_mapping(
     let expires_at = issued_at
         .checked_add(TOKEN_TTL_SECONDS)
         .ok_or_else(|| AppError::Internal("token expiration overflow".to_string()))?;
+    let signing_key = state
+        .signing
+        .active_signing_key(Utc::now())
+        .map_err(AppError::from)?;
 
     let mut header = Header::new(jsonwebtoken::Algorithm::ES256);
-    header.kid = Some(kid());
+    header.kid = Some(signing_key.kid.clone());
 
     let claims = IssuedClaims {
         exp: expires_at,
@@ -138,7 +119,7 @@ pub fn issue_token_for_mapping(
         extra: mapping.additional_claims.clone(),
     };
 
-    let access_token = encode(&header, &claims, &state.signing.encoding_key)
+    let access_token = encode(&header, &claims, &signing_key.encoding_key)
         .map_err(|e| AppError::Internal(format!("failed to encode token: {e}")))?;
 
     Ok(TokenResponse {
@@ -150,11 +131,10 @@ pub fn issue_token_for_mapping(
     })
 }
 
-pub fn jwks(state: &AppState) -> JwksResponse {
-    let verifying_key = VerifyingKey::from(&state.signing.signing_key);
-    JwksResponse {
-        keys: vec![build_jwk(&verifying_key, &kid())],
-    }
+pub fn jwks(state: &AppState) -> Result<JwksResponse, AppError> {
+    Ok(JwksResponse {
+        keys: state.signing.jwks(Utc::now()).map_err(AppError::from)?,
+    })
 }
 
 fn authenticate_subject(state: &AppState, bearer_token: &str) -> Result<String, AppError> {
@@ -204,33 +184,6 @@ fn now() -> Result<u64, AppError> {
         .map_err(|e| AppError::Internal(format!("system time error: {e}")))
 }
 
-fn kid() -> String {
-    "idmouse".to_string()
-}
-
-fn build_jwk(verifying_key: &VerifyingKey, kid: &str) -> Jwk {
-    let encoded = verifying_key.to_encoded_point(false);
-    let x = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
-        encoded
-            .x()
-            .expect("uncompressed P-256 points always have x"),
-    );
-    let y = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
-        encoded
-            .y()
-            .expect("uncompressed P-256 points always have y"),
-    );
-    Jwk {
-        kty: "EC".to_string(),
-        crv: "P-256".to_string(),
-        use_: "sig".to_string(),
-        alg: "ES256".to_string(),
-        kid: kid.to_string(),
-        x,
-        y,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
@@ -238,9 +191,9 @@ mod tests {
     };
     use crate::config::Config;
     use axum::http::{header, HeaderMap, HeaderValue};
+    use chrono::Utc;
     use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
-    use p256::ecdsa::VerifyingKey;
-    use p256::pkcs8::{EncodePublicKey, LineEnding};
+    use p256::pkcs8::EncodePublicKey;
     use serde::Serialize;
     use serde_json::json;
     use std::sync::Arc;
@@ -318,15 +271,22 @@ additional_claims = {{ ns = "default", db = "idelephant", sub = "idelephant", ac
         config.validate().unwrap();
 
         AppState {
+            signing: Arc::new(build_signing_state(&config).unwrap()),
             config: Arc::new(config),
-            signing: Arc::new(build_signing_state().unwrap()),
         }
     }
 
     fn public_key_pem(state: &AppState) -> String {
-        VerifyingKey::from(&state.signing.signing_key)
-            .to_public_key_pem(LineEnding::LF)
+        let jwk = state
+            .signing
+            .jwks(Utc::now())
             .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let key = jsonwebtoken::DecodingKey::from_ec_components(&jwk.x, &jwk.y).unwrap();
+        let pem = p256::ecdsa::VerifyingKey::from_sec1_bytes(key.as_bytes()).unwrap();
+        pem.to_public_key_pem(p256::pkcs8::LineEnding::LF).unwrap()
     }
 
     #[test]
@@ -394,7 +354,7 @@ additional_claims = {{ ns = "default", db = "idelephant", sub = "idelephant", ac
     #[test]
     fn publishes_ec_jwks() {
         let state = test_state();
-        let jwks = jwks(&state);
+        let jwks = jwks(&state).unwrap();
         assert_eq!(jwks.keys.len(), 1);
         assert_eq!(jwks.keys[0].alg, "ES256");
         assert_eq!(jwks.keys[0].kid, "idmouse");

@@ -6,6 +6,7 @@ new JWT selected by a named mapping.
 The config defines:
 
 - how incoming bearer tokens should be authenticated
+- how issued token signing keys are stored and rotated
 - a list of named mappings
 
 ## Request flow
@@ -28,6 +29,7 @@ The config defines:
 ```toml
 bind_address = "0.0.0.0:8080"
 origin = "http://idmouse.idmouse.svc"
+signing_key_storage = "in_memory"
 
 [authentication]
 audience = "idmouse"
@@ -46,6 +48,10 @@ HwIDAQAB
 
 # Optional. If omitted, idmouse will attempt OpenID Connect discovery via
 # <issuer>/.well-known/openid-configuration and use the returned jwks_uri.
+# Optional. One of "in_memory" or "kubernetes_secret".
+# "in_memory" is the default and generates a fresh signing key on startup.
+# "kubernetes_secret" stores rotated signing keys in the local-namespace Secret
+# named "idmouse-signing-keys" under data["keys"].
 
 [[mapping]]
 name = "idelephant"
@@ -82,10 +88,8 @@ Every issued token includes:
 
 It also includes every key from the selected mapping’s `additional_claims`.
 Issued tokens are always valid for 10 minutes.
-Issued tokens are always signed with ephemeral P-256 / `ES256` keys.
+Issued tokens are always signed with P-256 / `ES256` keys.
 
-## Temporary signing behavior
-
-For now, `idmouse` generates a fresh ES256 signing key each time it starts. That keeps private key
-material out of the config file, but it also means previously issued tokens stop verifying after a
-restart because the JWKS changes with each new process.
+When `signing_key_storage = "kubernetes_secret"`, `idmouse` maintains the current and next 8-hour
+rotation slots in the Kubernetes Secret `idmouse-signing-keys`. Keys become visible in JWKS up to
+8 hours before first use and remain visible for 1 hour after they stop being used.

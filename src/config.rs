@@ -8,9 +8,18 @@ pub struct Config {
     #[serde(default = "default_bind_address")]
     pub bind_address: String,
     pub origin: String,
+    #[serde(default = "default_signing_key_storage")]
+    pub signing_key_storage: SigningKeyStorage,
     pub authentication: AuthenticationConfig,
     #[serde(rename = "mapping", default)]
     pub mappings: Vec<MappingConfig>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SigningKeyStorage {
+    InMemory,
+    KubernetesSecret,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -91,4 +100,8 @@ fn default_bind_address() -> String {
 
 fn default_authentication_algorithm() -> String {
     "RS256".to_string()
+}
+
+fn default_signing_key_storage() -> SigningKeyStorage {
+    SigningKeyStorage::InMemory
 }
