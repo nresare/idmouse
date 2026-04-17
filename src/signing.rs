@@ -4,12 +4,13 @@ use crate::service::Jwk;
 use anyhow::Context;
 use base64::Engine;
 use chrono::{DateTime, Datelike, Duration, TimeZone, Timelike, Utc};
-use jsonwebtoken::EncodingKey;
+use jsonwebtoken::{encode, EncodingKey, Header};
 use p256::ecdsa::{SigningKey, VerifyingKey};
 use p256::elliptic_curve::rand_core::{OsRng, RngCore};
 use p256::pkcs8::{DecodePrivateKey, EncodePrivateKey, LineEnding};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 use std::collections::HashMap;
 use tracing::{debug, info};
 
@@ -20,13 +21,7 @@ const SECRET_DATA_KEY: &str = "keys";
 
 #[derive(Clone)]
 pub struct SigningState {
-    backend: SigningBackend,
-}
-
-#[derive(Clone)]
-enum SigningBackend {
-    InMemory(InMemorySigningState),
-    KubernetesSecret(KubernetesSecretSigningState),
+    backend: Box<dyn SigningBackend>,
 }
 
 #[derive(Clone)]
@@ -40,11 +35,11 @@ struct KubernetesSecretSigningState {
     namespace: String,
 }
 
-#[derive(Clone)]
-pub struct MaterializedSigningKey {
-    pub kid: String,
-    pub encoding_key: EncodingKey,
-    jwk: Jwk,
+pub struct SigningRequest {
+    pub expires_at: u64,
+    pub issued_at: u64,
+    pub issuer: String,
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -87,12 +82,41 @@ struct SecretMetadata {
     resource_version: Option<String>,
 }
 
+trait SigningBackend: Send + Sync {
+    fn sign(&self, request: &SigningRequest, now: DateTime<Utc>) -> anyhow::Result<String>;
+    fn jwks(&self, now: DateTime<Utc>) -> anyhow::Result<Vec<Jwk>>;
+    fn box_clone(&self) -> Box<dyn SigningBackend>;
+}
+
+impl Clone for Box<dyn SigningBackend> {
+    fn clone(&self) -> Self {
+        self.box_clone()
+    }
+}
+
+#[derive(Clone)]
+struct MaterializedSigningKey {
+    kid: String,
+    encoding_key: EncodingKey,
+    jwk: Jwk,
+}
+
+#[derive(Serialize)]
+struct SignedClaims<'a> {
+    exp: u64,
+    iat: u64,
+    nbf: u64,
+    iss: &'a str,
+    #[serde(flatten)]
+    extra: &'a Map<String, Value>,
+}
+
 impl SigningState {
     pub fn build(config: &Config) -> anyhow::Result<Self> {
-        let backend = match config.signing_key_storage {
+        let backend: Box<dyn SigningBackend> = match config.signing_key_storage {
             SigningKeyStorage::InMemory => {
                 info!("using in-memory signing key storage");
-                SigningBackend::InMemory(InMemorySigningState {
+                Box::new(InMemorySigningState {
                     key: materialize_key(&prepare_in_memory_key()?)?,
                 })
             }
@@ -105,25 +129,48 @@ impl SigningState {
                     .build()
                     .context("failed to build Kubernetes API client for signing key storage")?;
                 let namespace = kubernetes::local_namespace()?;
-                SigningBackend::KubernetesSecret(KubernetesSecretSigningState { client, namespace })
+                Box::new(KubernetesSecretSigningState { client, namespace })
             }
         };
 
         Ok(Self { backend })
     }
 
-    pub fn active_signing_key(&self, now: DateTime<Utc>) -> anyhow::Result<MaterializedSigningKey> {
-        match &self.backend {
-            SigningBackend::InMemory(state) => Ok(state.key.clone()),
-            SigningBackend::KubernetesSecret(state) => state.active_signing_key(now),
-        }
+    pub fn sign(&self, request: &SigningRequest, now: DateTime<Utc>) -> anyhow::Result<String> {
+        self.backend.sign(request, now)
     }
 
     pub fn jwks(&self, now: DateTime<Utc>) -> anyhow::Result<Vec<Jwk>> {
-        match &self.backend {
-            SigningBackend::InMemory(state) => Ok(vec![state.key.jwk.clone()]),
-            SigningBackend::KubernetesSecret(state) => state.jwks(now),
-        }
+        self.backend.jwks(now)
+    }
+}
+
+impl SigningBackend for InMemorySigningState {
+    fn sign(&self, request: &SigningRequest, _now: DateTime<Utc>) -> anyhow::Result<String> {
+        sign_with_key(&self.key, request)
+    }
+
+    fn jwks(&self, _now: DateTime<Utc>) -> anyhow::Result<Vec<Jwk>> {
+        Ok(vec![self.key.jwk.clone()])
+    }
+
+    fn box_clone(&self) -> Box<dyn SigningBackend> {
+        Box::new(self.clone())
+    }
+}
+
+impl SigningBackend for KubernetesSecretSigningState {
+    fn sign(&self, request: &SigningRequest, now: DateTime<Utc>) -> anyhow::Result<String> {
+        let key = self.active_signing_key(now)?;
+        sign_with_key(&key, request)
+    }
+
+    fn jwks(&self, now: DateTime<Utc>) -> anyhow::Result<Vec<Jwk>> {
+        self.jwks_for_time(now)
+    }
+
+    fn box_clone(&self) -> Box<dyn SigningBackend> {
+        Box::new(self.clone())
     }
 }
 
@@ -140,7 +187,7 @@ impl KubernetesSecretSigningState {
         materialize_key(key)
     }
 
-    fn jwks(&self, now: DateTime<Utc>) -> anyhow::Result<Vec<Jwk>> {
+    fn jwks_for_time(&self, now: DateTime<Utc>) -> anyhow::Result<Vec<Jwk>> {
         let keys = self.reconciled_keys(now)?;
         keys.iter()
             .map(|key| materialize_key(key).map(|materialized| materialized.jwk))
@@ -284,6 +331,21 @@ fn materialize_key(key: &StoredSigningKey) -> anyhow::Result<MaterializedSigning
         encoding_key,
         jwk: build_jwk(&verifying_key, &key.kid),
     })
+}
+
+fn sign_with_key(key: &MaterializedSigningKey, request: &SigningRequest) -> anyhow::Result<String> {
+    let mut header = Header::new(jsonwebtoken::Algorithm::ES256);
+    header.kid = Some(key.kid.clone());
+    let claims = SignedClaims {
+        exp: request.expires_at,
+        iat: request.issued_at,
+        nbf: request.issued_at,
+        iss: &request.issuer,
+        extra: &request.extra,
+    };
+
+    encode(&header, &claims, &key.encoding_key)
+        .map_err(|error| anyhow::anyhow!("failed to encode token: {error}"))
 }
 
 fn build_jwk(verifying_key: &VerifyingKey, kid: &str) -> Jwk {

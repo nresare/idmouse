@@ -1,12 +1,11 @@
 use crate::auth;
 use crate::config::{Config, MappingConfig};
 use crate::error::AppError;
-use crate::signing::SigningState;
+use crate::signing::{SigningRequest, SigningState};
 use axum::http::{header, HeaderMap};
 use chrono::Utc;
-use jsonwebtoken::{decode, encode, Header, Validation};
+use jsonwebtoken::{decode, Validation};
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::debug;
@@ -55,16 +54,6 @@ struct SourceClaims {
     sub: String,
 }
 
-#[derive(Debug, Serialize)]
-struct IssuedClaims {
-    exp: u64,
-    iat: u64,
-    nbf: u64,
-    iss: String,
-    #[serde(flatten)]
-    extra: Map<String, Value>,
-}
-
 pub fn build_signing_state(config: &Config) -> anyhow::Result<SigningState> {
     SigningState::build(config)
 }
@@ -103,24 +92,17 @@ pub fn issue_token_for_mapping(
     let expires_at = issued_at
         .checked_add(TOKEN_TTL_SECONDS)
         .ok_or_else(|| AppError::Internal("token expiration overflow".to_string()))?;
-    let signing_key = state
-        .signing
-        .active_signing_key(Utc::now())
-        .map_err(AppError::from)?;
-
-    let mut header = Header::new(jsonwebtoken::Algorithm::ES256);
-    header.kid = Some(signing_key.kid.clone());
-
-    let claims = IssuedClaims {
-        exp: expires_at,
-        iat: issued_at,
-        nbf: issued_at,
-        iss: state.config.origin.clone(),
+    let request = SigningRequest {
+        expires_at,
+        issued_at,
+        issuer: state.config.origin.clone(),
         extra: mapping.additional_claims.clone(),
     };
 
-    let access_token = encode(&header, &claims, &signing_key.encoding_key)
-        .map_err(|e| AppError::Internal(format!("failed to encode token: {e}")))?;
+    let access_token = state
+        .signing
+        .sign(&request, Utc::now())
+        .map_err(AppError::from)?;
 
     Ok(TokenResponse {
         access_token,
