@@ -3,7 +3,7 @@ use crate::config::{AuthenticationConfig, Config, MappingConfig};
 use crate::error::AppError;
 use crate::signing::{build_token_builder, TokenBuilder};
 use jsonwebtoken::{decode, Validation};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{Map, Value};
 use std::sync::Arc;
 use tracing::debug;
@@ -26,41 +26,19 @@ pub struct MappingResolver {
     mappings: Arc<Vec<MappingConfig>>,
 }
 
-#[derive(Debug, Serialize)]
-pub struct HealthResponse {
-    pub status: &'static str,
-}
-
-#[derive(Debug, Serialize)]
-pub struct JwksResponse {
-    pub keys: Vec<Jwk>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct Jwk {
-    pub kty: String,
-    pub crv: String,
-    #[serde(rename = "use")]
-    pub use_: String,
-    pub alg: String,
-    pub kid: String,
-    pub x: String,
-    pub y: String,
-}
-
 #[derive(Debug, Deserialize)]
 struct SourceClaims {
     sub: String,
 }
 
-pub fn build_app_state(config: Config) -> anyhow::Result<AppState> {
+pub fn build_app_state(config: &Config) -> anyhow::Result<AppState> {
     Ok(AppState {
         subject_validator: Arc::new(SubjectValidator::new(config.authentication.clone())),
         mapping_resolver: Arc::new(MappingResolver::new(
             config.origin.clone(),
             config.mappings.clone(),
         )),
-        token_builder: build_token_builder(&config)?,
+        token_builder: build_token_builder(config)?,
     })
 }
 
@@ -126,14 +104,6 @@ impl MappingResolver {
         let mut claims = mapping.additional_claims.clone();
         claims.insert("iss".to_string(), Value::String(self.origin.clone()));
         Ok(claims)
-    }
-}
-
-impl AppState {
-    pub fn jwks(&self) -> Result<JwksResponse, AppError> {
-        Ok(JwksResponse {
-            keys: self.token_builder.jwks().map_err(AppError::from)?,
-        })
     }
 }
 
@@ -217,7 +187,7 @@ additional_claims = {{ ns = "default", db = "idelephant", sub = "idelephant", ac
         );
         let config: Config = toml::from_str(&config_text).unwrap();
         config.validate().unwrap();
-        build_app_state(config).unwrap()
+        build_app_state(&config).unwrap()
     }
 
     fn public_key_pem(state: &AppState) -> String {

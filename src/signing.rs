@@ -1,13 +1,10 @@
 use crate::config::{Config, SigningKeyStorage};
-use crate::jwt::{jwk_for_signing_key, kid_for_signing_key};
-use crate::kubernetes;
-use crate::service::Jwk;
+use crate::jwt::{jwk_for_signing_key, Jwk};
 use crate::signing_kubernetes_secret::KubernetesSecretTokenBuilder;
-use anyhow::Context;
-use jsonwebtoken::{encode, EncodingKey, Header};
+use crate::{jwt, kubernetes};
+use anyhow::{Context, Result};
 use p256::ecdsa::SigningKey;
 use p256::elliptic_curve::rand_core::OsRng;
-use p256::pkcs8::{EncodePrivateKey, LineEnding};
 use reqwest::blocking::Client;
 use serde_json::{Map, Value};
 use std::sync::Arc;
@@ -16,8 +13,8 @@ use tracing::info;
 pub const TOKEN_TTL_SECONDS: u64 = 600;
 
 pub trait TokenBuilder: Send + Sync {
-    fn build(&self, claims: &Map<String, Value>) -> anyhow::Result<String>;
-    fn jwks(&self) -> anyhow::Result<Vec<Jwk>>;
+    fn build(&self, claims: &Map<String, Value>) -> Result<String>;
+    fn jwks(&self) -> Result<Vec<Jwk>>;
 }
 
 #[derive(Clone)]
@@ -33,7 +30,7 @@ impl InMemoryTokenBuilder {
     }
 }
 
-pub fn build_token_builder(config: &Config) -> anyhow::Result<Arc<dyn TokenBuilder>> {
+pub fn build_token_builder(config: &Config) -> Result<Arc<dyn TokenBuilder>> {
     let builder: Arc<dyn TokenBuilder> = match config.signing_key_storage {
         SigningKeyStorage::InMemory => {
             info!("using in-memory signing key storage");
@@ -56,40 +53,19 @@ pub fn build_token_builder(config: &Config) -> anyhow::Result<Arc<dyn TokenBuild
 }
 
 impl TokenBuilder for InMemoryTokenBuilder {
-    fn build(&self, claims: &Map<String, Value>) -> anyhow::Result<String> {
-        build_token(&self.signing_key, claims)
+    fn build(&self, claims: &Map<String, Value>) -> Result<String> {
+        jwt::build_token(&self.signing_key, claims)
     }
 
-    fn jwks(&self) -> anyhow::Result<Vec<Jwk>> {
+    fn jwks(&self) -> Result<Vec<Jwk>> {
         Ok(vec![jwk_for_signing_key(&self.signing_key)])
     }
 }
 
-pub(crate) fn build_token(
-    signing_key: &SigningKey,
-    claims: &Map<String, Value>,
-) -> anyhow::Result<String> {
-    let mut header = Header::new(jsonwebtoken::Algorithm::ES256);
-    header.kid = Some(kid_for_signing_key(signing_key));
-
-    let private_key_pem = signing_key
-        .to_pkcs8_pem(LineEnding::LF)
-        .context("failed to encode ES256 private key for token signing")?;
-    let encoding_key = EncodingKey::from_ec_pem(private_key_pem.as_bytes())
-        .context("failed to create JWT encoding key from ES256 private key")?;
-
-    encode(&header, claims, &encoding_key)
-        .map_err(|error| anyhow::anyhow!("failed to encode token: {error}"))
-}
-
-pub(crate) fn is_conflict(error: &anyhow::Error) -> bool {
-    error.to_string().contains("409 Conflict")
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{build_token, InMemoryTokenBuilder, TokenBuilder};
-    use crate::jwt::{jwk_for_signing_key, kid_for_signing_key};
+    use super::{InMemoryTokenBuilder, TokenBuilder};
+    use crate::jwt::{build_token, jwk_for_signing_key, kid_for_signing_key};
     use crate::signing::TOKEN_TTL_SECONDS;
     use anyhow::Result;
     use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};

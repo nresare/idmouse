@@ -1,7 +1,6 @@
-use crate::jwt::{jwk_for_signing_key, kid_for_signing_key};
+use crate::jwt::{build_token, jwk_for_signing_key, kid_for_signing_key, Jwk};
 use crate::kubernetes;
-use crate::service::Jwk;
-use crate::signing::{build_token, is_conflict, TokenBuilder};
+use crate::signing::TokenBuilder;
 use anyhow::Context;
 use base64::engine::general_purpose::STANDARD as B64_STANDARD;
 use base64::Engine;
@@ -211,6 +210,10 @@ fn parse_secret_document(secret: &SecretResponse) -> anyhow::Result<StoredSignin
         .context("failed to base64-decode signing key secret data")?;
     serde_json::from_slice(&decoded)
         .context("failed to parse signing key JSON from Kubernetes Secret")
+}
+
+fn is_conflict(error: &anyhow::Error) -> bool {
+    error.to_string().contains("409 Conflict")
 }
 
 #[derive(Clone, Serialize, Deserialize)]

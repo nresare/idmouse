@@ -9,7 +9,7 @@ mod signing_kubernetes_secret;
 
 use crate::config::Config;
 use crate::error::AppError;
-use crate::service::{build_app_state, AppState, HealthResponse, JwksResponse};
+use crate::service::{build_app_state, AppState};
 use crate::signing::TOKEN_TTL_SECONDS;
 use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap};
@@ -17,7 +17,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use clap::Parser;
 use serde::Serialize;
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 use std::net::SocketAddr;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tower_http::trace::{self, TraceLayer};
@@ -65,7 +65,7 @@ async fn run() -> anyhow::Result<()> {
 
     info!(version = VERSION, config_path = %cli.config_path, "starting idmouse");
 
-    let state = build_app_state(config)?;
+    let state = build_app_state(&config)?;
 
     let app = Router::new()
         .route("/healthz", get(healthz))
@@ -84,8 +84,13 @@ async fn run() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn healthz() -> Json<HealthResponse> {
-    Json(HealthResponse { status: "ok" })
+async fn healthz() -> Json<Value> {
+    Json(json!({ "status": "ok" }))
+}
+
+async fn jwks_handler(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+    let keys = state.token_builder.jwks().map_err(AppError::from)?;
+    Ok(Json(json!({"keys": keys})))
 }
 
 async fn token(
@@ -108,13 +113,7 @@ async fn token(
     }))
 }
 
-async fn jwks_handler(State(state): State<AppState>) -> Result<Json<JwksResponse>, AppError> {
-    Ok(Json(state.jwks()?))
-}
-
-fn add_timestamps(
-    claims: &mut Map<String, Value>,
-) -> Result<(), AppError> {
+fn add_timestamps(claims: &mut Map<String, Value>) -> Result<(), AppError> {
     let issued_at = now()?;
     let expires_at = issued_at
         .checked_add(TOKEN_TTL_SECONDS)
