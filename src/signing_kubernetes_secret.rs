@@ -1,12 +1,14 @@
+use crate::jwt::{jwk_for_signing_key, kid_for_signing_key};
 use crate::kubernetes;
 use crate::service::Jwk;
-use crate::signing::{
-    is_conflict, list_visible_keys, materialize_key, reconcile_stored_keys, MaterializedSigningKey,
-    SigningBackend,
-};
+use crate::signing::{build_token, is_conflict, TokenBuilder};
 use anyhow::Context;
+use base64::engine::general_purpose::STANDARD as B64_STANDARD;
 use base64::Engine;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, Duration, TimeZone, Timelike, Utc};
+use p256::ecdsa::SigningKey;
+use p256::elliptic_curve::rand_core::OsRng;
+use p256::pkcs8::{DecodePrivateKey, EncodePrivateKey, LineEnding};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -15,12 +17,8 @@ use tracing::debug;
 
 const SECRET_NAME: &str = "idmouse-signing-keys";
 const SECRET_DATA_KEY: &str = "keys";
-
-#[derive(Clone)]
-pub(crate) struct KubernetesSecretSigningState {
-    pub(crate) client: Client,
-    pub(crate) namespace: String,
-}
+const ROTATION_HOURS: i64 = 8;
+const RETIRED_KEY_GRACE_HOURS: i64 = 1;
 
 #[derive(Default, Serialize, Deserialize)]
 struct StoredSigningKeysDocument {
@@ -53,10 +51,16 @@ struct SecretUpsertRequest {
     data: HashMap<String, String>,
 }
 
-impl SigningBackend for KubernetesSecretSigningState {
-    fn sign(&self, claims: &Map<String, Value>) -> anyhow::Result<String> {
+#[derive(Clone)]
+pub(crate) struct KubernetesSecretTokenBuilder {
+    pub(crate) client: Client,
+    pub(crate) namespace: String,
+}
+
+impl TokenBuilder for KubernetesSecretTokenBuilder {
+    fn build(&self, claims: &Map<String, Value>) -> anyhow::Result<String> {
         let key = self.active_signing_key(Utc::now())?;
-        crate::signing::sign_with_key(&key, claims)
+        build_token(&key, claims)
     }
 
     fn jwks(&self) -> anyhow::Result<Vec<Jwk>> {
@@ -64,8 +68,8 @@ impl SigningBackend for KubernetesSecretSigningState {
     }
 }
 
-impl KubernetesSecretSigningState {
-    fn active_signing_key(&self, now: DateTime<Utc>) -> anyhow::Result<MaterializedSigningKey> {
+impl KubernetesSecretTokenBuilder {
+    fn active_signing_key(&self, now: DateTime<Utc>) -> anyhow::Result<SigningKey> {
         let keys = self.reconciled_keys(now)?;
         let key = keys
             .iter()
@@ -74,13 +78,16 @@ impl KubernetesSecretSigningState {
             .ok_or_else(|| {
                 anyhow::anyhow!("no active signing key available after reconciliation")
             })?;
-        materialize_key(key)
+        stored_signing_key_to_signing_key(key)
     }
 
     fn jwks_for_time(&self, now: DateTime<Utc>) -> anyhow::Result<Vec<Jwk>> {
         let keys = self.reconciled_keys(now)?;
         keys.iter()
-            .map(|key| materialize_key(key).map(|materialized| materialized.jwk))
+            .map(|key| {
+                stored_signing_key_to_signing_key(key)
+                    .map(|signing_key| jwk_for_signing_key(&signing_key))
+            })
             .collect()
     }
 
@@ -144,7 +151,7 @@ impl KubernetesSecretSigningState {
         let mut data = HashMap::new();
         data.insert(
             SECRET_DATA_KEY.to_string(),
-            base64::engine::general_purpose::STANDARD.encode(serialized_document),
+            B64_STANDARD.encode(serialized_document),
         );
 
         let metadata = SecretMetadata {
@@ -199,7 +206,7 @@ fn parse_secret_document(secret: &SecretResponse) -> anyhow::Result<StoredSignin
     let encoded = secret.data.get(SECRET_DATA_KEY).ok_or_else(|| {
         anyhow::anyhow!("Kubernetes Secret '{SECRET_NAME}' is missing data['{SECRET_DATA_KEY}']")
     })?;
-    let decoded = base64::engine::general_purpose::STANDARD
+    let decoded = B64_STANDARD
         .decode(encoded)
         .context("failed to base64-decode signing key secret data")?;
     serde_json::from_slice(&decoded)
@@ -213,4 +220,112 @@ pub(crate) struct StoredSigningKey {
     pub(crate) active_from: DateTime<Utc>,
     pub(crate) retire_after: DateTime<Utc>,
     pub(crate) created_at: DateTime<Utc>,
+}
+
+fn stored_signing_key_to_signing_key(key: &StoredSigningKey) -> anyhow::Result<SigningKey> {
+    SigningKey::from_pkcs8_pem(&key.private_key_pem)
+        .context("failed to decode stored ES256 private key")
+}
+
+fn reconcile_stored_keys(
+    keys: &mut Vec<StoredSigningKey>,
+    now: DateTime<Utc>,
+) -> anyhow::Result<()> {
+    keys.retain(|key| key.retire_after > now);
+
+    let current_slot = slot_start(now)?;
+    let next_slot = current_slot + Duration::hours(ROTATION_HOURS);
+    ensure_key_for_slot(keys, current_slot)?;
+    ensure_key_for_slot(keys, next_slot)?;
+    keys.sort_by_key(|key| key.active_from);
+    Ok(())
+}
+
+fn ensure_key_for_slot(
+    keys: &mut Vec<StoredSigningKey>,
+    active_from: DateTime<Utc>,
+) -> anyhow::Result<()> {
+    if keys.iter().any(|key| key.active_from == active_from) {
+        return Ok(());
+    }
+
+    let signing_key = SigningKey::random(&mut OsRng);
+    let private_key_pem = signing_key
+        .to_pkcs8_pem(LineEnding::LF)
+        .context("failed to encode rotated ES256 private key")?;
+    keys.push(StoredSigningKey {
+        kid: kid_for_signing_key(&signing_key),
+        private_key_pem: private_key_pem.to_string(),
+        active_from,
+        retire_after: active_from + Duration::hours(ROTATION_HOURS + RETIRED_KEY_GRACE_HOURS),
+        created_at: Utc::now(),
+    });
+    Ok(())
+}
+
+fn slot_start(now: DateTime<Utc>) -> anyhow::Result<DateTime<Utc>> {
+    let hour = now.hour() as i64;
+    let slot_hour = hour - (hour % ROTATION_HOURS);
+    Utc.with_ymd_and_hms(now.year(), now.month(), now.day(), slot_hour as u32, 0, 0)
+        .single()
+        .ok_or_else(|| anyhow::anyhow!("failed to calculate signing key rotation slot"))
+}
+
+fn list_visible_keys(keys: Vec<StoredSigningKey>, now: DateTime<Utc>) -> Vec<StoredSigningKey> {
+    keys.into_iter()
+        .filter(|key| key.retire_after > now)
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{reconcile_stored_keys, slot_start, StoredSigningKey};
+    use anyhow::Result;
+    use chrono::{Duration, TimeZone, Utc};
+
+    #[test]
+    fn slot_start_rounds_down_to_8_hour_boundary() -> Result<()> {
+        let now = Utc.with_ymd_and_hms(2026, 4, 12, 15, 7, 11).unwrap();
+        assert_eq!(
+            slot_start(now)?,
+            Utc.with_ymd_and_hms(2026, 4, 12, 8, 0, 0).unwrap()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reconcile_creates_current_and_next_slots() -> Result<()> {
+        let now = Utc.with_ymd_and_hms(2026, 4, 12, 10, 0, 0).unwrap();
+        let mut keys = Vec::new();
+        reconcile_stored_keys(&mut keys, now)?;
+        assert_eq!(keys.len(), 2);
+        assert_eq!(
+            keys[0].active_from,
+            Utc.with_ymd_and_hms(2026, 4, 12, 8, 0, 0).unwrap()
+        );
+        assert_eq!(
+            keys[1].active_from,
+            Utc.with_ymd_and_hms(2026, 4, 12, 16, 0, 0).unwrap()
+        );
+        assert_eq!(
+            keys[0].retire_after,
+            Utc.with_ymd_and_hms(2026, 4, 12, 17, 0, 0).unwrap()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reconcile_keeps_recently_retired_key_for_one_hour() -> Result<()> {
+        let now = Utc.with_ymd_and_hms(2026, 4, 12, 8, 1, 0).unwrap();
+        let mut keys = vec![StoredSigningKey {
+            kid: "old".to_string(),
+            private_key_pem: "pem".to_string(),
+            active_from: Utc.with_ymd_and_hms(2026, 4, 12, 0, 0, 0).unwrap(),
+            retire_after: Utc.with_ymd_and_hms(2026, 4, 12, 9, 0, 0).unwrap(),
+            created_at: now - Duration::hours(8),
+        }];
+        reconcile_stored_keys(&mut keys, now)?;
+        assert_eq!(keys.len(), 3);
+        Ok(())
+    }
 }
