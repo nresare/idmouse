@@ -38,6 +38,8 @@ struct Cli {
         default_value = "/config/idmouse.toml"
     )]
     config_path: String,
+    #[arg(long = "disable-auth", default_value_t = false)]
+    disable_auth: bool,
 }
 
 #[tokio::main]
@@ -60,12 +62,17 @@ async fn main() -> anyhow::Result<()> {
 async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let config = Config::load(&cli.config_path)?;
-    config.validate()?;
+    config.validate(cli.disable_auth)?;
     let bind_address: SocketAddr = config.bind_address.parse()?;
 
-    info!(version = VERSION, config_path = %cli.config_path, "starting idmouse");
+    info!(
+        version = VERSION,
+        config_path = %cli.config_path,
+        disable_auth = cli.disable_auth,
+        "starting idmouse"
+    );
 
-    let state = build_app_state(&config)?;
+    let state = build_app_state(&config, cli.disable_auth)?;
 
     let app = Router::new()
         .route("/healthz", get(healthz))
@@ -98,8 +105,8 @@ async fn token(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<TokenResponse>, AppError> {
-    let bearer_token = extract_bearer_token(&headers)?;
-    let source_subject = state.subject_validator.validate(&bearer_token)?;
+    let bearer_token = extract_bearer_token(&headers).ok();
+    let source_subject = state.subject_validator.validate(bearer_token.as_deref())?;
     let mut claims = state.mapping_resolver.resolve(&name, &source_subject)?;
     add_timestamps(&mut claims)?;
     let token = state.token_builder.build(&claims)?;
@@ -108,7 +115,6 @@ async fn token(
         access_token: token,
         token_type: "Bearer",
         expires_in: TOKEN_TTL_SECONDS,
-        mapping: name,
         source_subject,
     }))
 }
@@ -152,6 +158,5 @@ pub struct TokenResponse {
     pub access_token: String,
     pub token_type: &'static str,
     pub expires_in: u64,
-    pub mapping: String,
     pub source_subject: String,
 }

@@ -1,6 +1,7 @@
 bind_address = "0.0.0.0:8080"
 origin = "http://idmouse.idmouse.svc"
 
+# This section is required unless the service is started with --disable-auth.
 [authentication]
 audience = "idmouse"
 issuer = "https://kubernetes.default.svc"
@@ -19,9 +20,13 @@ HwIDAQAB
 [[mapping]]
 name = "idelephant"
 allowed_subjects = ["system:serviceaccount:idelephant:idelephant"]
-additional_claims = { ns = "default", db = "idelephant", sub = "idelephant", ac = "token_name", id = "idelephant" }
+additional_claims = { ns = "default", db = "idelephant", sub = "idelephant", ac = "idelephant", rl = ["Editor"] }
 
 [[mapping]]
 name = "some_other_mapping"
 allowed_subjects = ["system:serviceaccount:default:default"]
 additional_claims = { ns = "ns_name", db = "foo" }
+
+[[mapping]]
+name = "root"
+additional_claims = { ac = "root", rl = ["Owner"] }

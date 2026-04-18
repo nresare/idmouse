@@ -17,13 +17,20 @@ pub struct AppState {
 
 #[derive(Clone)]
 pub struct SubjectValidator {
-    authentication: AuthenticationConfig,
+    mode: SubjectValidationMode,
+}
+
+#[derive(Clone)]
+enum SubjectValidationMode {
+    Disabled,
+    Enabled(AuthenticationConfig),
 }
 
 #[derive(Clone)]
 pub struct MappingResolver {
     origin: String,
     mappings: Arc<Vec<MappingConfig>>,
+    disable_auth: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -31,52 +38,72 @@ struct SourceClaims {
     sub: String,
 }
 
-pub fn build_app_state(config: &Config) -> anyhow::Result<AppState> {
+pub fn build_app_state(config: &Config, disable_auth: bool) -> anyhow::Result<AppState> {
     Ok(AppState {
-        subject_validator: Arc::new(SubjectValidator::new(config.authentication.clone())),
+        subject_validator: Arc::new(SubjectValidator::new(
+            config.authentication.clone(),
+            disable_auth,
+        )),
         mapping_resolver: Arc::new(MappingResolver::new(
             config.origin.clone(),
             config.mappings.clone(),
+            disable_auth,
         )),
         token_builder: build_token_builder(config)?,
     })
 }
 
 impl SubjectValidator {
-    pub fn new(authentication: AuthenticationConfig) -> Self {
-        Self { authentication }
+    pub fn new(authentication: AuthenticationConfig, disable_auth: bool) -> Self {
+        let mode = if disable_auth {
+            SubjectValidationMode::Disabled
+        } else {
+            SubjectValidationMode::Enabled(authentication)
+        };
+        Self { mode }
     }
 
-    pub fn validate(&self, bearer_token: &str) -> Result<String, AppError> {
-        let algorithm = auth::algorithm(&self.authentication)?;
-        debug!(
-            issuer = %self.authentication.issuer,
-            audience = %self.authentication.audience,
-            algorithm = ?algorithm,
-            "preparing source token validation"
-        );
-        let mut validation = Validation::new(algorithm);
-        validation.set_audience(&[&self.authentication.audience]);
-        validation.set_issuer(&[&self.authentication.issuer]);
-        debug!("resolving decoding key for source token validation");
-        let decoding_key = auth::resolving_decoding_key(&self.authentication, bearer_token)
-            .map_err(AppError::from)?;
-        debug!("resolved decoding key for source token validation");
+    pub fn validate(&self, bearer_token: Option<&str>) -> Result<String, AppError> {
+        match &self.mode {
+            SubjectValidationMode::Disabled => Ok("unauthenticated".to_string()),
+            SubjectValidationMode::Enabled(authentication) => {
+                let bearer_token = bearer_token.ok_or_else(|| {
+                    AppError::Unauthorized("missing Authorization header".to_string())
+                })?;
+                let algorithm = auth::algorithm(authentication)?;
+                debug!(
+                    issuer = %authentication.issuer,
+                    audience = %authentication.audience,
+                    algorithm = ?algorithm,
+                    "preparing source token validation"
+                );
+                let mut validation = Validation::new(algorithm);
+                validation.set_audience(&[&authentication.audience]);
+                validation.set_issuer(&[&authentication.issuer]);
+                debug!("resolving decoding key for source token validation");
+                let decoding_key = auth::resolving_decoding_key(authentication, bearer_token)
+                    .map_err(AppError::from)?;
+                debug!("resolved decoding key for source token validation");
 
-        debug!("validating source token signature and claims");
-        let decoded = decode::<SourceClaims>(bearer_token, &decoding_key, &validation)
-            .map_err(|e| AppError::Unauthorized(format!("failed to validate source token: {e}")))?;
-        debug!(subject = %decoded.claims.sub, "source token validation succeeded");
+                debug!("validating source token signature and claims");
+                let decoded = decode::<SourceClaims>(bearer_token, &decoding_key, &validation)
+                    .map_err(|e| {
+                        AppError::Unauthorized(format!("failed to validate source token: {e}"))
+                    })?;
+                debug!(subject = %decoded.claims.sub, "source token validation succeeded");
 
-        Ok(decoded.claims.sub)
+                Ok(decoded.claims.sub)
+            }
+        }
     }
 }
 
 impl MappingResolver {
-    pub fn new(origin: String, mappings: Vec<MappingConfig>) -> Self {
+    pub fn new(origin: String, mappings: Vec<MappingConfig>, disable_auth: bool) -> Self {
         Self {
             origin,
             mappings: Arc::new(mappings),
+            disable_auth,
         }
     }
 
@@ -91,10 +118,11 @@ impl MappingResolver {
             .find(|mapping| mapping.name == mapping_name)
             .ok_or_else(|| AppError::NotFound(format!("unknown mapping '{mapping_name}'")))?;
 
-        if !mapping
-            .allowed_subjects
-            .iter()
-            .any(|allowed_subject| allowed_subject == subject)
+        if !self.disable_auth
+            && !mapping
+                .allowed_subjects
+                .iter()
+                .any(|allowed_subject| allowed_subject == subject)
         {
             return Err(AppError::Unauthorized(format!(
                 "subject '{subject}' is not allowed to use mapping '{mapping_name}'"
@@ -186,8 +214,8 @@ additional_claims = {{ ns = "default", db = "idelephant", sub = "idelephant", ac
 "#
         );
         let config: Config = toml::from_str(&config_text).unwrap();
-        config.validate().unwrap();
-        build_app_state(&config).unwrap()
+        config.validate(false).unwrap();
+        build_app_state(&config, false).unwrap()
     }
 
     fn public_key_pem(state: &AppState) -> String {
@@ -258,7 +286,7 @@ additional_claims = {{ ns = "default", db = "idelephant", sub = "idelephant", ac
         )
         .unwrap();
 
-        let subject = state.subject_validator.validate(&token).unwrap();
+        let subject = state.subject_validator.validate(Some(&token)).unwrap();
         let claims = state
             .mapping_resolver
             .resolve("idelephant", &subject)
@@ -282,5 +310,27 @@ additional_claims = {{ ns = "default", db = "idelephant", sub = "idelephant", ac
         assert_eq!(jwks.len(), 1);
         assert_eq!(jwks[0].alg, "ES256");
         assert!(!jwks[0].kid.is_empty());
+    }
+
+    #[test]
+    fn bypasses_authentication_when_disabled() {
+        let config_text = r#"
+bind_address = "127.0.0.1:8080"
+origin = "http://idmouse.idmouse.svc"
+
+[[mapping]]
+name = "open-access"
+additional_claims = { sub = "open-access" }
+"#;
+        let config: Config = toml::from_str(config_text).unwrap();
+        config.validate(true).unwrap();
+        let state = build_app_state(&config, true).unwrap();
+
+        let subject = state.subject_validator.validate(None).unwrap();
+        assert_eq!(subject, "unauthenticated");
+
+        let claims = state.mapping_resolver.resolve("open-access", &subject).unwrap();
+        assert_eq!(claims["iss"], json!("http://idmouse.idmouse.svc"));
+        assert_eq!(claims["sub"], json!("open-access"));
     }
 }

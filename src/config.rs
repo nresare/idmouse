@@ -10,6 +10,7 @@ pub struct Config {
     pub origin: String,
     #[serde(default = "default_signing_key_storage")]
     pub signing_key_storage: SigningKeyStorage,
+    #[serde(default)]
     pub authentication: AuthenticationConfig,
     #[serde(rename = "mapping", default)]
     pub mappings: Vec<MappingConfig>,
@@ -22,9 +23,11 @@ pub enum SigningKeyStorage {
     KubernetesSecret,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct AuthenticationConfig {
+    #[serde(default)]
     pub audience: String,
+    #[serde(default)]
     pub issuer: String,
     pub validation_key: Option<String>,
     #[serde(default = "default_authentication_algorithm")]
@@ -48,7 +51,7 @@ impl Config {
             .map_err(|error| anyhow::anyhow!("Could not parse config file '{path}': {error}"))
     }
 
-    pub fn validate(&self) -> anyhow::Result<()> {
+    pub fn validate(&self, disable_auth: bool) -> anyhow::Result<()> {
         if self.origin.is_empty() {
             anyhow::bail!("origin must not be empty");
         }
@@ -61,7 +64,7 @@ impl Config {
             if mapping.name.is_empty() {
                 anyhow::bail!("mapping names must not be empty");
             }
-            if mapping.allowed_subjects.is_empty() {
+            if !disable_auth && mapping.allowed_subjects.is_empty() {
                 anyhow::bail!(
                     "mapping '{}' must define at least one allowed_subject",
                     mapping.name
@@ -72,7 +75,9 @@ impl Config {
             }
         }
 
-        self.authentication.validate()?;
+        if !disable_auth {
+            self.authentication.validate()?;
+        }
         Ok(())
     }
 }

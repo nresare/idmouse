@@ -1,17 +1,18 @@
 # idmouse
 
-`idmouse` is a Rust service built with Axum for exchanging an authenticated incoming JWT into a
+`idmouse` is a Rust service built with Axum for exchanging an incoming JWT into a
 new JWT selected by a named mapping.
 
 The config defines:
 
-- how incoming bearer tokens should be authenticated
+- how incoming bearer tokens should be authenticated when auth is enabled
 - how issued token signing keys are stored and rotated
 - a list of named mappings
 
 ## Request flow
 
-1. Call `POST /token/<mapping-name>` with an `Authorization: Bearer ...` header.
+1. Call `POST /token/<mapping-name>`.
+   When auth is enabled, include an `Authorization: Bearer ...` header.
 2. `idmouse` validates the incoming token using the configured authentication issuer, audience, and
    validation key when one is configured.
    If `validation_key` is omitted, `idmouse` fetches
@@ -23,6 +24,10 @@ The config defines:
 3. The incoming token subject must be present in the mapping’s `allowed_subjects`.
 4. `idmouse` issues a new JWT containing standard timing claims plus the mapping’s
    `additional_claims`.
+
+When started with `--disable-auth`, `idmouse` skips source token validation entirely. In that
+mode, callers do not need to send an `Authorization` header, `allowed_subjects` is not enforced,
+and the `[authentication]` config section may be omitted.
 
 ## Example config
 
@@ -75,6 +80,14 @@ Example:
 ```bash
 curl -s http://127.0.0.1:8080/token/idelephant \
   -H "Authorization: Bearer $SOURCE_TOKEN"
+```
+
+With authentication disabled:
+
+```bash
+idmouse --config-file /config/idmouse.toml --disable-auth
+
+curl -s -X POST http://127.0.0.1:8080/token/idelephant
 ```
 
 ## Issued claims
