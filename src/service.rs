@@ -1,7 +1,7 @@
 use crate::auth;
 use crate::config::{AuthenticationConfig, Config, MappingConfig};
 use crate::error::AppError;
-use crate::signing::{build_signing_backend, SigningBackend};
+use crate::signing::{build_token_builder, TokenBuilder};
 use jsonwebtoken::{decode, Validation};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -12,7 +12,7 @@ use tracing::debug;
 pub struct AppState {
     pub subject_validator: Arc<SubjectValidator>,
     pub mapping_resolver: Arc<MappingResolver>,
-    pub token_signer: Arc<dyn SigningBackend>,
+    pub token_builder: Arc<dyn TokenBuilder>,
 }
 
 #[derive(Clone)]
@@ -60,7 +60,7 @@ pub fn build_app_state(config: Config) -> anyhow::Result<AppState> {
             config.origin.clone(),
             config.mappings.clone(),
         )),
-        token_signer: build_signing_backend(&config)?,
+        token_builder: build_token_builder(&config)?,
     })
 }
 
@@ -132,7 +132,7 @@ impl MappingResolver {
 impl AppState {
     pub fn jwks(&self) -> Result<JwksResponse, AppError> {
         Ok(JwksResponse {
-            keys: self.token_signer.jwks().map_err(AppError::from)?,
+            keys: self.token_builder.jwks().map_err(AppError::from)?,
         })
     }
 }
@@ -222,7 +222,7 @@ additional_claims = {{ ns = "default", db = "idelephant", sub = "idelephant", ac
 
     fn public_key_pem(state: &AppState) -> String {
         let jwk = state
-            .token_signer
+            .token_builder
             .jwks()
             .unwrap()
             .into_iter()
@@ -251,7 +251,7 @@ additional_claims = {{ ns = "default", db = "idelephant", sub = "idelephant", ac
             .mapping_resolver
             .resolve("idelephant", "system:serviceaccount:idelephant:idelephant")
             .unwrap();
-        let access_token = state.token_signer.sign(&finalize_claims(claims)).unwrap();
+        let access_token = state.token_builder.build(&finalize_claims(claims)).unwrap();
 
         let mut validation = Validation::new(jsonwebtoken::Algorithm::ES256);
         validation.set_issuer(&["http://idmouse.idmouse.svc"]);
@@ -293,7 +293,7 @@ additional_claims = {{ ns = "default", db = "idelephant", sub = "idelephant", ac
             .mapping_resolver
             .resolve("idelephant", &subject)
             .unwrap();
-        let access_token = state.token_signer.sign(&finalize_claims(claims)).unwrap();
+        let access_token = state.token_builder.build(&finalize_claims(claims)).unwrap();
         let mut validation = Validation::new(jsonwebtoken::Algorithm::ES256);
         validation.set_issuer(&["http://idmouse.idmouse.svc"]);
         let decoded = decode::<serde_json::Value>(
@@ -308,9 +308,9 @@ additional_claims = {{ ns = "default", db = "idelephant", sub = "idelephant", ac
     #[test]
     fn publishes_ec_jwks() {
         let state = test_state();
-        let jwks = state.token_signer.jwks().unwrap();
+        let jwks = state.token_builder.jwks().unwrap();
         assert_eq!(jwks.len(), 1);
         assert_eq!(jwks[0].alg, "ES256");
-        assert_eq!(jwks[0].kid, "idmouse");
+        assert!(!jwks[0].kid.is_empty());
     }
 }

@@ -1,47 +1,43 @@
 use crate::config::{Config, SigningKeyStorage};
+use crate::jwt::{jwk_for_signing_key, kid_for_signing_key};
 use crate::kubernetes;
 use crate::service::Jwk;
-use crate::signing_kubernetes_secret::{KubernetesSecretSigningState, StoredSigningKey};
+use crate::signing_kubernetes_secret::KubernetesSecretTokenBuilder;
 use anyhow::Context;
-use base64::Engine;
-use chrono::{DateTime, Datelike, Duration, TimeZone, Timelike, Utc};
 use jsonwebtoken::{encode, EncodingKey, Header};
-use p256::ecdsa::{SigningKey, VerifyingKey};
-use p256::elliptic_curve::rand_core::{OsRng, RngCore};
-use p256::pkcs8::{DecodePrivateKey, EncodePrivateKey, LineEnding};
+use p256::ecdsa::SigningKey;
+use p256::elliptic_curve::rand_core::OsRng;
+use p256::pkcs8::{EncodePrivateKey, LineEnding};
 use reqwest::blocking::Client;
 use serde_json::{Map, Value};
 use std::sync::Arc;
 use tracing::info;
 
-const ROTATION_HOURS: i64 = 8;
-const RETIRED_KEY_GRACE_HOURS: i64 = 1;
 pub const TOKEN_TTL_SECONDS: u64 = 600;
 
-pub trait SigningBackend: Send + Sync {
-    fn sign(&self, claims: &Map<String, Value>) -> anyhow::Result<String>;
+pub trait TokenBuilder: Send + Sync {
+    fn build(&self, claims: &Map<String, Value>) -> anyhow::Result<String>;
     fn jwks(&self) -> anyhow::Result<Vec<Jwk>>;
 }
 
 #[derive(Clone)]
-struct InMemorySigningBackend {
-    key: MaterializedSigningKey,
+pub(crate) struct InMemoryTokenBuilder {
+    signing_key: SigningKey,
 }
 
-#[derive(Clone)]
-pub(crate) struct MaterializedSigningKey {
-    pub(crate) kid: String,
-    pub(crate) encoding_key: EncodingKey,
-    pub(crate) jwk: Jwk,
+impl InMemoryTokenBuilder {
+    pub fn new() -> Self {
+        Self {
+            signing_key: SigningKey::random(&mut OsRng),
+        }
+    }
 }
 
-pub fn build_signing_backend(config: &Config) -> anyhow::Result<Arc<dyn SigningBackend>> {
-    let backend: Arc<dyn SigningBackend> = match config.signing_key_storage {
+pub fn build_token_builder(config: &Config) -> anyhow::Result<Arc<dyn TokenBuilder>> {
+    let builder: Arc<dyn TokenBuilder> = match config.signing_key_storage {
         SigningKeyStorage::InMemory => {
             info!("using in-memory signing key storage");
-            Arc::new(InMemorySigningBackend {
-                key: materialize_key(&prepare_in_memory_key()?)?,
-            })
+            Arc::new(InMemoryTokenBuilder::new())
         }
         SigningKeyStorage::KubernetesSecret => {
             info!(
@@ -52,142 +48,38 @@ pub fn build_signing_backend(config: &Config) -> anyhow::Result<Arc<dyn SigningB
                 .build()
                 .context("failed to build Kubernetes API client for signing key storage")?;
             let namespace = kubernetes::local_namespace()?;
-            Arc::new(KubernetesSecretSigningState { client, namespace })
+            Arc::new(KubernetesSecretTokenBuilder { client, namespace })
         }
     };
 
-    Ok(backend)
+    Ok(builder)
 }
 
-impl SigningBackend for InMemorySigningBackend {
-    fn sign(&self, claims: &Map<String, Value>) -> anyhow::Result<String> {
-        sign_with_key(&self.key, claims)
+impl TokenBuilder for InMemoryTokenBuilder {
+    fn build(&self, claims: &Map<String, Value>) -> anyhow::Result<String> {
+        build_token(&self.signing_key, claims)
     }
 
     fn jwks(&self) -> anyhow::Result<Vec<Jwk>> {
-        Ok(vec![self.key.jwk.clone()])
+        Ok(vec![jwk_for_signing_key(&self.signing_key)])
     }
 }
 
-fn prepare_in_memory_key() -> anyhow::Result<StoredSigningKey> {
-    let now = Utc::now();
-    let signing_key = SigningKey::random(&mut OsRng);
-    let private_key_pem = signing_key
-        .to_pkcs8_pem(LineEnding::LF)
-        .context("failed to encode generated ES256 private key")?;
-    Ok(StoredSigningKey {
-        kid: "idmouse".to_string(),
-        private_key_pem: private_key_pem.to_string(),
-        active_from: now,
-        retire_after: now + Duration::days(365 * 100),
-        created_at: now,
-    })
-}
-
-pub(crate) fn materialize_key(key: &StoredSigningKey) -> anyhow::Result<MaterializedSigningKey> {
-    let signing_key = SigningKey::from_pkcs8_pem(&key.private_key_pem)
-        .context("failed to decode stored ES256 private key")?;
-    let verifying_key = VerifyingKey::from(&signing_key);
-    let encoding_key = EncodingKey::from_ec_pem(key.private_key_pem.as_bytes())
-        .context("failed to create JWT encoding key from ES256 private key")?;
-    Ok(MaterializedSigningKey {
-        kid: key.kid.clone(),
-        encoding_key,
-        jwk: build_jwk(&verifying_key, &key.kid),
-    })
-}
-
-pub(crate) fn sign_with_key(
-    key: &MaterializedSigningKey,
+pub(crate) fn build_token(
+    signing_key: &SigningKey,
     claims: &Map<String, Value>,
 ) -> anyhow::Result<String> {
     let mut header = Header::new(jsonwebtoken::Algorithm::ES256);
-    header.kid = Some(key.kid.clone());
+    header.kid = Some(kid_for_signing_key(signing_key));
 
-    encode(&header, claims, &key.encoding_key)
-        .map_err(|error| anyhow::anyhow!("failed to encode token: {error}"))
-}
-
-fn build_jwk(verifying_key: &VerifyingKey, kid: &str) -> Jwk {
-    let encoded = verifying_key.to_encoded_point(false);
-    let x = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
-        encoded
-            .x()
-            .expect("uncompressed P-256 points always have x"),
-    );
-    let y = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
-        encoded
-            .y()
-            .expect("uncompressed P-256 points always have y"),
-    );
-    Jwk {
-        kty: "EC".to_string(),
-        crv: "P-256".to_string(),
-        use_: "sig".to_string(),
-        alg: "ES256".to_string(),
-        kid: kid.to_string(),
-        x,
-        y,
-    }
-}
-
-pub(crate) fn reconcile_stored_keys(
-    keys: &mut Vec<StoredSigningKey>,
-    now: DateTime<Utc>,
-) -> anyhow::Result<()> {
-    keys.retain(|key| key.retire_after > now);
-
-    let current_slot = slot_start(now)?;
-    let next_slot = current_slot + Duration::hours(ROTATION_HOURS);
-    ensure_key_for_slot(keys, current_slot)?;
-    ensure_key_for_slot(keys, next_slot)?;
-    keys.sort_by_key(|key| key.active_from);
-    Ok(())
-}
-
-fn ensure_key_for_slot(
-    keys: &mut Vec<StoredSigningKey>,
-    active_from: DateTime<Utc>,
-) -> anyhow::Result<()> {
-    if keys.iter().any(|key| key.active_from == active_from) {
-        return Ok(());
-    }
-
-    let signing_key = SigningKey::random(&mut OsRng);
     let private_key_pem = signing_key
         .to_pkcs8_pem(LineEnding::LF)
-        .context("failed to encode rotated ES256 private key")?;
-    keys.push(StoredSigningKey {
-        kid: random_kid(),
-        private_key_pem: private_key_pem.to_string(),
-        active_from,
-        retire_after: active_from + Duration::hours(ROTATION_HOURS + RETIRED_KEY_GRACE_HOURS),
-        created_at: Utc::now(),
-    });
-    Ok(())
-}
+        .context("failed to encode ES256 private key for token signing")?;
+    let encoding_key = EncodingKey::from_ec_pem(private_key_pem.as_bytes())
+        .context("failed to create JWT encoding key from ES256 private key")?;
 
-fn slot_start(now: DateTime<Utc>) -> anyhow::Result<DateTime<Utc>> {
-    let hour = now.hour() as i64;
-    let slot_hour = hour - (hour % ROTATION_HOURS);
-    Utc.with_ymd_and_hms(now.year(), now.month(), now.day(), slot_hour as u32, 0, 0)
-        .single()
-        .ok_or_else(|| anyhow::anyhow!("failed to calculate signing key rotation slot"))
-}
-
-fn random_kid() -> String {
-    let mut bytes = [0_u8; 24];
-    OsRng.fill_bytes(&mut bytes);
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
-}
-
-pub(crate) fn list_visible_keys(
-    keys: Vec<StoredSigningKey>,
-    now: DateTime<Utc>,
-) -> Vec<StoredSigningKey> {
-    keys.into_iter()
-        .filter(|key| key.retire_after > now)
-        .collect()
+    encode(&header, claims, &encoding_key)
+        .map_err(|error| anyhow::anyhow!("failed to encode token: {error}"))
 }
 
 pub(crate) fn is_conflict(error: &anyhow::Error) -> bool {
@@ -196,50 +88,111 @@ pub(crate) fn is_conflict(error: &anyhow::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{reconcile_stored_keys, slot_start};
-    use crate::signing_kubernetes_secret::StoredSigningKey;
+    use super::{build_token, InMemoryTokenBuilder, TokenBuilder};
+    use crate::jwt::{jwk_for_signing_key, kid_for_signing_key};
+    use crate::signing::TOKEN_TTL_SECONDS;
     use anyhow::Result;
-    use chrono::{Duration, TimeZone, Utc};
+    use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
+    use p256::ecdsa::SigningKey;
+    use p256::elliptic_curve::rand_core::OsRng;
+    use serde_json::{json, Map, Value};
 
     #[test]
-    fn slot_start_rounds_down_to_8_hour_boundary() -> Result<()> {
-        let now = Utc.with_ymd_and_hms(2026, 4, 12, 15, 7, 11).unwrap();
+    fn in_memory_builder_builds_es256_token_with_matching_kid() -> Result<()> {
+        let signing_key = SigningKey::random(&mut OsRng);
+        let builder = InMemoryTokenBuilder {
+            signing_key: signing_key.clone(),
+        };
+        let claims = sample_claims();
+
+        let token = builder.build(&claims)?;
+        let header = decode_header(&token)?;
+        let jwk = builder.jwks()?.pop().unwrap();
+
+        assert_eq!(header.alg, Algorithm::ES256);
+        assert_eq!(header.kid.as_deref(), Some(jwk.kid.as_str()));
+        assert_eq!(jwk.kid, kid_for_signing_key(&signing_key));
+        Ok(())
+    }
+
+    #[test]
+    fn in_memory_builder_emits_jwks_that_validates_issued_tokens() -> Result<()> {
+        let builder = InMemoryTokenBuilder {
+            signing_key: SigningKey::random(&mut OsRng),
+        };
+        let claims = sample_claims();
+        let token = builder.build(&claims)?;
+        let jwk = builder.jwks()?.pop().unwrap();
+
+        let mut validation = Validation::new(Algorithm::ES256);
+        validation.validate_exp = false;
+        validation.required_spec_claims.clear();
+        let decoded = decode::<Value>(
+            &token,
+            &DecodingKey::from_ec_components(&jwk.x, &jwk.y)?,
+            &validation,
+        )?;
+
+        assert_eq!(decoded.claims["sub"], json!("idelephant"));
+        assert_eq!(decoded.claims["iss"], json!("http://idmouse.idmouse.svc"));
         assert_eq!(
-            slot_start(now)?,
-            Utc.with_ymd_and_hms(2026, 4, 12, 8, 0, 0).unwrap()
+            decoded.claims["exp"],
+            json!(4_102_444_800_u64 + TOKEN_TTL_SECONDS)
         );
         Ok(())
     }
 
     #[test]
-    fn reconcile_creates_current_and_next_slots() -> Result<()> {
-        let now = Utc.with_ymd_and_hms(2026, 4, 12, 10, 0, 0).unwrap();
-        let mut keys = Vec::new();
-        reconcile_stored_keys(&mut keys, now)?;
-        assert_eq!(keys.len(), 2);
-        assert_eq!(
-            keys[0].active_from,
-            Utc.with_ymd_and_hms(2026, 4, 12, 8, 0, 0).unwrap()
-        );
-        assert_eq!(
-            keys[1].active_from,
-            Utc.with_ymd_and_hms(2026, 4, 12, 16, 0, 0).unwrap()
-        );
-        Ok(())
+    fn jwks_is_derived_from_signing_key_coordinates() {
+        let signing_key = SigningKey::random(&mut OsRng);
+        let expected = jwk_for_signing_key(&signing_key);
+
+        assert_eq!(expected.alg, "ES256");
+        assert_eq!(expected.kty, "EC");
+        assert_eq!(expected.crv, "P-256");
+        assert_eq!(expected.use_, "sig");
+        assert!(!expected.kid.is_empty());
+        assert!(!expected.x.is_empty());
+        assert!(!expected.y.is_empty());
     }
 
     #[test]
-    fn reconcile_keeps_recently_retired_key_for_one_hour() -> Result<()> {
-        let now = Utc.with_ymd_and_hms(2026, 4, 12, 8, 1, 0).unwrap();
-        let mut keys = vec![StoredSigningKey {
-            kid: "old".to_string(),
-            private_key_pem: "pem".to_string(),
-            active_from: Utc.with_ymd_and_hms(2026, 4, 12, 0, 0, 0).unwrap(),
-            retire_after: Utc.with_ymd_and_hms(2026, 4, 12, 9, 0, 0).unwrap(),
-            created_at: now - Duration::hours(8),
-        }];
-        reconcile_stored_keys(&mut keys, now)?;
-        assert_eq!(keys.len(), 3);
+    fn build_token_preserves_all_supplied_claims() -> Result<()> {
+        let signing_key = SigningKey::random(&mut OsRng);
+        let claims = sample_claims();
+
+        let token = build_token(&signing_key, &claims)?;
+        let jwk = jwk_for_signing_key(&signing_key);
+
+        let mut validation = Validation::new(Algorithm::ES256);
+        validation.validate_exp = false;
+        validation.required_spec_claims.clear();
+        let decoded = decode::<Value>(
+            &token,
+            &DecodingKey::from_ec_components(&jwk.x, &jwk.y)?,
+            &validation,
+        )?;
+
+        let decoded_claims = decoded.claims.as_object().unwrap();
+        assert_eq!(decoded_claims.get("ns"), Some(&json!("default")));
+        assert_eq!(decoded_claims.get("db"), Some(&json!("idelephant")));
+        assert_eq!(decoded_claims.get("ac"), Some(&json!("token_name")));
         Ok(())
+    }
+
+    fn sample_claims() -> Map<String, Value> {
+        Map::from_iter([
+            ("iss".to_string(), json!("http://idmouse.idmouse.svc")),
+            ("sub".to_string(), json!("idelephant")),
+            ("ns".to_string(), json!("default")),
+            ("db".to_string(), json!("idelephant")),
+            ("ac".to_string(), json!("token_name")),
+            ("iat".to_string(), json!(4_102_444_800_u64)),
+            ("nbf".to_string(), json!(4_102_444_800_u64)),
+            (
+                "exp".to_string(),
+                json!(4_102_444_800_u64 + TOKEN_TTL_SECONDS),
+            ),
+        ])
     }
 }

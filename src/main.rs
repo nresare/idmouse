@@ -1,6 +1,7 @@
 mod auth;
 mod config;
 mod error;
+mod jwt;
 mod kubernetes;
 mod service;
 mod signing;
@@ -16,7 +17,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use clap::Parser;
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::net::SocketAddr;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tower_http::trace::{self, TraceLayer};
@@ -95,17 +96,11 @@ async fn token(
     let bearer_token = extract_bearer_token(&headers)?;
     let source_subject = state.subject_validator.validate(&bearer_token)?;
     let mut claims = state.mapping_resolver.resolve(&name, &source_subject)?;
-    let issued_at = now()?;
-    let expires_at = issued_at
-        .checked_add(TOKEN_TTL_SECONDS)
-        .ok_or_else(|| AppError::Internal("token expiration overflow".to_string()))?;
-    claims.insert("iat".to_string(), Value::from(issued_at));
-    claims.insert("nbf".to_string(), Value::from(issued_at));
-    claims.insert("exp".to_string(), Value::from(expires_at));
-    let access_token = state.token_signer.sign(&claims)?;
+    add_timestamps(&mut claims)?;
+    let token = state.token_builder.build(&claims)?;
 
     Ok(Json(TokenResponse {
-        access_token,
+        access_token: token,
         token_type: "Bearer",
         expires_in: TOKEN_TTL_SECONDS,
         mapping: name,
@@ -115,6 +110,19 @@ async fn token(
 
 async fn jwks_handler(State(state): State<AppState>) -> Result<Json<JwksResponse>, AppError> {
     Ok(Json(state.jwks()?))
+}
+
+fn add_timestamps(
+    claims: &mut Map<String, Value>,
+) -> Result<(), AppError> {
+    let issued_at = now()?;
+    let expires_at = issued_at
+        .checked_add(TOKEN_TTL_SECONDS)
+        .ok_or_else(|| AppError::Internal("token expiration overflow".to_string()))?;
+    claims.insert("iat".to_string(), Value::from(issued_at));
+    claims.insert("nbf".to_string(), Value::from(issued_at));
+    claims.insert("exp".to_string(), Value::from(expires_at));
+    Ok(())
 }
 
 fn extract_bearer_token(headers: &HeaderMap) -> Result<String, AppError> {
