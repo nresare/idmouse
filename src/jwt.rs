@@ -1,14 +1,47 @@
-use crate::service::Jwk;
+use anyhow::Context;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64_URL_SAFE_NO_PAD;
 use base64::Engine;
+use jsonwebtoken::{encode, EncodingKey, Header};
 use p256::ecdsa::{SigningKey, VerifyingKey};
+use p256::pkcs8::{EncodePrivateKey, LineEnding};
+use serde::Serialize;
+use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Jwk {
+    pub kty: String,
+    pub crv: String,
+    #[serde(rename = "use")]
+    pub use_: String,
+    pub alg: String,
+    pub kid: String,
+    pub x: String,
+    pub y: String,
+}
 
 pub(crate) fn kid_for_signing_key(signing_key: &SigningKey) -> String {
     let verifying_key = VerifyingKey::from(signing_key);
     let encoded = verifying_key.to_encoded_point(true);
     let digest = Sha256::digest(encoded.as_bytes());
     B64_URL_SAFE_NO_PAD.encode(&digest[..6])
+}
+
+pub(crate) fn build_token(
+    signing_key: &SigningKey,
+    claims: &Map<String, Value>,
+) -> anyhow::Result<String> {
+    let mut header = Header::new(jsonwebtoken::Algorithm::ES256);
+    header.kid = Some(kid_for_signing_key(signing_key));
+
+    let private_key_pem = signing_key
+        .to_pkcs8_pem(LineEnding::LF)
+        .context("failed to encode ES256 private key for token signing")?;
+    let encoding_key = EncodingKey::from_ec_pem(private_key_pem.as_bytes())
+        .context("failed to create JWT encoding key from ES256 private key")?;
+
+    encode(&header, claims, &encoding_key)
+        .map_err(|error| anyhow::anyhow!("failed to encode token: {error}"))
 }
 
 pub(crate) fn jwk_for_signing_key(signing_key: &SigningKey) -> Jwk {
