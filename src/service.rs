@@ -329,7 +329,10 @@ additional_claims = { sub = "open-access" }
         let subject = state.subject_validator.validate(None).unwrap();
         assert_eq!(subject, "unauthenticated");
 
-        let claims = state.mapping_resolver.resolve("open-access", &subject).unwrap();
+        let claims = state
+            .mapping_resolver
+            .resolve("open-access", &subject)
+            .unwrap();
         assert_eq!(claims["iss"], json!("http://idmouse.idmouse.svc"));
         assert_eq!(claims["sub"], json!("open-access"));
     }
