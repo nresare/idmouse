@@ -3,6 +3,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Serialize;
 use thiserror::Error;
+use tracing::debug;
 
 #[derive(Debug, Error)]
 pub enum AppError {
@@ -21,12 +22,15 @@ struct ErrorBody<'a> {
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        let status = match self {
+        let message = self.to_string();
+        let status = match &self {
             AppError::NotFound(_) => StatusCode::NOT_FOUND,
-            AppError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
+            AppError::Unauthorized(_) => {
+                debug!(reason = %message, "request rejected as unauthorized");
+                StatusCode::UNAUTHORIZED
+            }
             AppError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
-        let message = self.to_string();
         (status, Json(ErrorBody { error: &message })).into_response()
     }
 }

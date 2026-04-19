@@ -96,6 +96,10 @@ impl SubjectValidator {
             }
         }
     }
+
+    pub fn auth_enabled(&self) -> bool {
+        matches!(self.mode, SubjectValidationMode::Enabled(_))
+    }
 }
 
 impl MappingResolver {

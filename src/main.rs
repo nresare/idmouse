@@ -105,7 +105,11 @@ async fn token(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<TokenResponse>, AppError> {
-    let bearer_token = extract_bearer_token(&headers).ok();
+    let bearer_token = match extract_bearer_token(&headers) {
+        Ok(token) => Some(token),
+        Err(_) if !state.subject_validator.auth_enabled() => None,
+        Err(error) => return Err(error),
+    };
     let source_subject = state.subject_validator.validate(bearer_token.as_deref())?;
     let mut claims = state.mapping_resolver.resolve(&name, &source_subject)?;
     add_timestamps(&mut claims)?;
