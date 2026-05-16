@@ -12,6 +12,7 @@ The config defines:
 ## Request flow
 
 1. Call `POST /token/<mapping-name>`.
+   Optionally add `?ttl=<seconds>` to request a shorter-lived token.
    When auth is enabled, include an `Authorization: Bearer ...` header.
 2. `idmouse` validates the incoming token using the configured authentication issuer, audience, and
    validation key when one is configured.
@@ -80,6 +81,9 @@ Example:
 ```bash
 curl -s http://127.0.0.1:8080/token/idelephant \
   -H "Authorization: Bearer $SOURCE_TOKEN"
+
+curl -s "http://127.0.0.1:8080/token/idelephant?ttl=60" \
+  -H "Authorization: Bearer $SOURCE_TOKEN"
 ```
 
 With authentication disabled:
@@ -100,7 +104,8 @@ Every issued token includes:
 - `iss`
 
 It also includes every key from the selected mapping’s `additional_claims`.
-Issued tokens are always valid for 10 minutes.
+Issued tokens are valid for up to 10 minutes.
+Callers may request a shorter TTL with the optional `ttl` query parameter.
 Issued tokens are always signed with P-256 / `ES256` keys.
 
 When `signing_key_storage = "kubernetes_secret"`, `idmouse` maintains the current and next 8-hour

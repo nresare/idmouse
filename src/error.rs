@@ -8,6 +8,8 @@ use tracing::debug;
 #[derive(Debug, Error)]
 pub enum AppError {
     #[error("{0}")]
+    BadRequest(String),
+    #[error("{0}")]
     NotFound(String),
     #[error("{0}")]
     Unauthorized(String),
@@ -24,6 +26,7 @@ impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let message = self.to_string();
         let status = match &self {
+            AppError::BadRequest(_) => StatusCode::BAD_REQUEST,
             AppError::NotFound(_) => StatusCode::NOT_FOUND,
             AppError::Unauthorized(_) => {
                 debug!(reason = %message, "request rejected as unauthorized");
