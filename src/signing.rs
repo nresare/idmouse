@@ -10,7 +10,7 @@ use serde_json::{Map, Value};
 use std::sync::Arc;
 use tracing::info;
 
-pub const TOKEN_TTL_SECONDS: u64 = 600;
+pub const TOKEN_TTL_SECONDS: u64 = 3600;
 
 pub trait TokenBuilder: Send + Sync {
     fn build(&self, claims: &Map<String, Value>) -> Result<String>;
