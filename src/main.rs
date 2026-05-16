@@ -11,11 +11,12 @@ use crate::config::Config;
 use crate::error::AppError;
 use crate::service::{build_app_state, AppState};
 use crate::signing::TOKEN_TTL_SECONDS;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use clap::Parser;
+use serde::Deserialize;
 use serde::Serialize;
 use serde_json::{json, Map, Value};
 use std::net::SocketAddr;
@@ -103,6 +104,7 @@ async fn jwks_handler(State(state): State<AppState>) -> Result<Json<Value>, AppE
 async fn token(
     Path(name): Path<String>,
     State(state): State<AppState>,
+    Query(query): Query<TokenQuery>,
     headers: HeaderMap,
 ) -> Result<Json<TokenResponse>, AppError> {
     let bearer_token = match extract_bearer_token(&headers) {
@@ -112,26 +114,47 @@ async fn token(
     };
     let source_subject = state.subject_validator.validate(bearer_token.as_deref())?;
     let mut claims = state.mapping_resolver.resolve(&name, &source_subject)?;
-    add_timestamps(&mut claims)?;
+    let ttl = resolve_ttl(query.ttl.as_deref())?;
+    add_timestamps(&mut claims, ttl)?;
     let token = state.token_builder.build(&claims)?;
 
     Ok(Json(TokenResponse {
         access_token: token,
         token_type: "Bearer",
-        expires_in: TOKEN_TTL_SECONDS,
+        expires_in: ttl,
         source_subject,
     }))
 }
 
-fn add_timestamps(claims: &mut Map<String, Value>) -> Result<(), AppError> {
+fn add_timestamps(claims: &mut Map<String, Value>, ttl_seconds: u64) -> Result<(), AppError> {
     let issued_at = now()?;
     let expires_at = issued_at
-        .checked_add(TOKEN_TTL_SECONDS)
+        .checked_add(ttl_seconds)
         .ok_or_else(|| AppError::Internal("token expiration overflow".to_string()))?;
     claims.insert("iat".to_string(), Value::from(issued_at));
     claims.insert("nbf".to_string(), Value::from(issued_at));
     claims.insert("exp".to_string(), Value::from(expires_at));
     Ok(())
+}
+
+fn resolve_ttl(ttl: Option<&str>) -> Result<u64, AppError> {
+    match ttl {
+        None => Ok(TOKEN_TTL_SECONDS),
+        Some(ttl) => {
+            let ttl = ttl.parse::<u64>().map_err(|_| {
+                AppError::BadRequest("ttl must be an integer number of seconds".to_string())
+            })?;
+            match ttl {
+                0 => Err(AppError::BadRequest(
+                    "ttl must be greater than 0 seconds".to_string(),
+                )),
+                ttl if ttl > TOKEN_TTL_SECONDS => Err(AppError::BadRequest(format!(
+                    "ttl must be less than or equal to {TOKEN_TTL_SECONDS} seconds"
+                ))),
+                ttl => Ok(ttl),
+            }
+        }
+    }
 }
 
 fn extract_bearer_token(headers: &HeaderMap) -> Result<String, AppError> {
@@ -163,4 +186,54 @@ pub struct TokenResponse {
     pub token_type: &'static str,
     pub expires_in: u64,
     pub source_subject: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct TokenQuery {
+    ttl: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_ttl;
+    use crate::error::AppError;
+    use crate::signing::TOKEN_TTL_SECONDS;
+
+    #[test]
+    fn ttl_defaults_to_maximum() {
+        assert_eq!(resolve_ttl(None).unwrap(), TOKEN_TTL_SECONDS);
+    }
+
+    #[test]
+    fn ttl_accepts_shorter_duration() {
+        assert_eq!(resolve_ttl(Some("60")).unwrap(), 60);
+    }
+
+    #[test]
+    fn ttl_rejects_non_numeric_values() {
+        let error = resolve_ttl(Some("abc")).unwrap_err();
+        assert!(matches!(error, AppError::BadRequest(_)));
+        assert_eq!(
+            error.to_string(),
+            "ttl must be an integer number of seconds"
+        );
+    }
+
+    #[test]
+    fn ttl_rejects_zero() {
+        let error = resolve_ttl(Some("0")).unwrap_err();
+        assert!(matches!(error, AppError::BadRequest(_)));
+        assert_eq!(error.to_string(), "ttl must be greater than 0 seconds");
+    }
+
+    #[test]
+    fn ttl_rejects_values_above_maximum() {
+        let over_max = (TOKEN_TTL_SECONDS + 1).to_string();
+        let error = resolve_ttl(Some(&over_max)).unwrap_err();
+        assert!(matches!(error, AppError::BadRequest(_)));
+        assert_eq!(
+            error.to_string(),
+            format!("ttl must be less than or equal to {TOKEN_TTL_SECONDS} seconds")
+        );
+    }
 }
