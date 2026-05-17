@@ -1,4 +1,3 @@
-mod auth;
 mod config;
 mod error;
 mod jwt;
@@ -112,8 +111,11 @@ async fn token(
         Err(_) if !state.subject_validator.auth_enabled() => None,
         Err(error) => return Err(error),
     };
-    let source_subject = state.subject_validator.validate(bearer_token.as_deref())?;
-    let mut claims = state.mapping_resolver.resolve(&name, &source_subject)?;
+    let mapping_role = state.mapping_resolver.role_for(&name)?;
+    let source_subject = state
+        .subject_validator
+        .validate(mapping_role, bearer_token.as_deref())?;
+    let mut claims = state.mapping_resolver.resolve(&name)?;
     let ttl = resolve_ttl(query.ttl.as_deref())?;
     add_timestamps(&mut claims, ttl)?;
     let token = state.token_builder.build(&claims)?;

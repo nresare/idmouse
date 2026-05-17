@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0"
+authzoo = "0.1.3"
 axum = "0.8"
 base64 = "0.23"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }

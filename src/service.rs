@@ -1,9 +1,6 @@
-use crate::auth;
-use crate::config::{AuthenticationConfig, Config, MappingConfig};
+use crate::config::{Config, MappingConfig};
 use crate::error::AppError;
 use crate::signing::{build_token_builder, TokenBuilder};
-use jsonwebtoken::{decode, Validation};
-use serde::Deserialize;
 use serde_json::{Map, Value};
 use std::sync::Arc;
 use tracing::debug;
@@ -23,76 +20,74 @@ pub struct SubjectValidator {
 #[derive(Clone)]
 enum SubjectValidationMode {
     Disabled,
-    Enabled(AuthenticationConfig),
+    Enabled(authzoo::TokenValidator),
 }
 
 #[derive(Clone)]
 pub struct MappingResolver {
     origin: String,
     mappings: Arc<Vec<MappingConfig>>,
-    disable_auth: bool,
-}
-
-#[derive(Debug, Deserialize)]
-struct SourceClaims {
-    sub: String,
 }
 
 pub fn build_app_state(config: &Config, disable_auth: bool) -> anyhow::Result<AppState> {
     Ok(AppState {
-        subject_validator: Arc::new(SubjectValidator::new(
-            config.authentication.clone(),
-            disable_auth,
-        )),
+        subject_validator: Arc::new(SubjectValidator::new(config.roles.clone(), disable_auth)?),
         mapping_resolver: Arc::new(MappingResolver::new(
             config.origin.clone(),
             config.mappings.clone(),
-            disable_auth,
         )),
         token_builder: build_token_builder(config)?,
     })
 }
 
 impl SubjectValidator {
-    pub fn new(authentication: AuthenticationConfig, disable_auth: bool) -> Self {
+    pub fn new(roles: Vec<authzoo::RoleConfig>, disable_auth: bool) -> anyhow::Result<Self> {
         let mode = if disable_auth {
             SubjectValidationMode::Disabled
         } else {
-            SubjectValidationMode::Enabled(authentication)
+            SubjectValidationMode::Enabled(authzoo::TokenValidator::new(roles)?)
         };
-        Self { mode }
+        Ok(Self { mode })
     }
 
-    pub fn validate(&self, bearer_token: Option<&str>) -> Result<String, AppError> {
+    pub fn validate(
+        &self,
+        role: Option<&str>,
+        bearer_token: Option<&str>,
+    ) -> Result<String, AppError> {
         match &self.mode {
             SubjectValidationMode::Disabled => Ok("unauthenticated".to_string()),
-            SubjectValidationMode::Enabled(authentication) => {
+            SubjectValidationMode::Enabled(validator) => {
+                let role = role.ok_or_else(|| {
+                    AppError::Internal("mapping is missing a role reference".to_string())
+                })?;
                 let bearer_token = bearer_token.ok_or_else(|| {
                     AppError::Unauthorized("missing Authorization header".to_string())
                 })?;
-                let algorithm = auth::algorithm(authentication)?;
                 debug!(
-                    issuer = %authentication.issuer,
-                    audience = %authentication.audience,
-                    algorithm = ?algorithm,
+                    role = %role,
                     "preparing source token validation"
                 );
-                let mut validation = Validation::new(algorithm);
-                validation.set_audience(&[&authentication.audience]);
-                validation.set_issuer(&[&authentication.issuer]);
-                debug!("resolving decoding key for source token validation");
-                let decoding_key = auth::resolving_decoding_key(authentication, bearer_token)
-                    .map_err(AppError::from)?;
-                debug!("resolved decoding key for source token validation");
+                let assumed_roles = validator.validate(bearer_token);
+                if !assumed_roles.iter().any(|assumed| assumed == role) {
+                    return Err(AppError::Unauthorized(format!(
+                        "source token cannot assume role '{role}'"
+                    )));
+                }
 
-                debug!("validating source token signature and claims");
-                let decoded = decode::<SourceClaims>(bearer_token, &decoding_key, &validation)
-                    .map_err(|e| {
-                        AppError::Unauthorized(format!("failed to validate source token: {e}"))
-                    })?;
-                debug!(subject = %decoded.claims.sub, "source token validation succeeded");
-
-                Ok(decoded.claims.sub)
+                // authzoo has already validated this token while resolving its roles. Decode the
+                // same claims type once more so the API can retain its source_subject response.
+                let claims = jsonwebtoken::dangerous::insecure_decode::<authzoo::ValidatedClaims>(
+                    bearer_token,
+                )
+                .map_err(|error| {
+                    AppError::Internal(format!(
+                        "failed to read claims from validated source token: {error}"
+                    ))
+                })?
+                .claims;
+                debug!(subject = %claims.subject(), "source token validation succeeded");
+                Ok(claims.subject().to_string())
             }
         }
     }
@@ -103,35 +98,28 @@ impl SubjectValidator {
 }
 
 impl MappingResolver {
-    pub fn new(origin: String, mappings: Vec<MappingConfig>, disable_auth: bool) -> Self {
+    pub fn new(origin: String, mappings: Vec<MappingConfig>) -> Self {
         Self {
             origin,
             mappings: Arc::new(mappings),
-            disable_auth,
         }
     }
 
-    pub fn resolve(
-        &self,
-        mapping_name: &str,
-        subject: &str,
-    ) -> Result<Map<String, Value>, AppError> {
+    pub fn role_for(&self, mapping_name: &str) -> Result<Option<&str>, AppError> {
         let mapping = self
             .mappings
             .iter()
             .find(|mapping| mapping.name == mapping_name)
             .ok_or_else(|| AppError::NotFound(format!("unknown mapping '{mapping_name}'")))?;
+        Ok(mapping.role.as_deref())
+    }
 
-        if !self.disable_auth
-            && !mapping
-                .allowed_subjects
-                .iter()
-                .any(|allowed_subject| allowed_subject == subject)
-        {
-            return Err(AppError::Unauthorized(format!(
-                "subject '{subject}' is not allowed to use mapping '{mapping_name}'"
-            )));
-        }
+    pub fn resolve(&self, mapping_name: &str) -> Result<Map<String, Value>, AppError> {
+        let mapping = self
+            .mappings
+            .iter()
+            .find(|mapping| mapping.name == mapping_name)
+            .ok_or_else(|| AppError::NotFound(format!("unknown mapping '{mapping_name}'")))?;
 
         let mut claims = mapping.additional_claims.clone();
         claims.insert("iss".to_string(), Value::String(self.origin.clone()));
@@ -203,16 +191,20 @@ iQIDAQAB
 bind_address = "127.0.0.1:8080"
 origin = "http://idmouse.idmouse.svc"
 
-[authentication]
+[[role]]
+name = "idelephant-source"
 audience = "idmouse"
 issuer = "https://kubernetes.default.svc"
-validation_key = """
+validation-key = """
 {SOURCE_PUBLIC_KEY}
 """
 
+[role.claims]
+sub = "system:serviceaccount:idelephant:idelephant"
+
 [[mapping]]
 name = "idelephant"
-allowed_subjects = ["system:serviceaccount:idelephant:idelephant"]
+role = "idelephant-source"
 additional_claims = {{ ns = "default", db = "idelephant", sub = "idelephant", ac = "token_name", id = "idelephant" }}
 
 "#
@@ -246,13 +238,27 @@ additional_claims = {{ ns = "default", db = "idelephant", sub = "idelephant", ac
         claims
     }
 
+    fn source_token(subject: &str) -> String {
+        let now = 4_102_444_800;
+        encode(
+            &Header::new(jsonwebtoken::Algorithm::RS256),
+            &SourceTokenClaims {
+                sub: subject,
+                iss: "https://kubernetes.default.svc",
+                aud: "idmouse",
+                exp: now + 60,
+                nbf: now - 60,
+                iat: now - 60,
+            },
+            &EncodingKey::from_rsa_pem(SOURCE_PRIVATE_KEY.as_bytes()).unwrap(),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn issues_mapping_claims() {
         let state = test_state();
-        let claims = state
-            .mapping_resolver
-            .resolve("idelephant", "system:serviceaccount:idelephant:idelephant")
-            .unwrap();
+        let claims = state.mapping_resolver.resolve("idelephant").unwrap();
         let access_token = state.token_builder.build(&finalize_claims(claims)).unwrap();
 
         let mut validation = Validation::new(jsonwebtoken::Algorithm::ES256);
@@ -275,26 +281,17 @@ additional_claims = {{ ns = "default", db = "idelephant", sub = "idelephant", ac
     #[test]
     fn authenticates_source_token_subject() {
         let state = test_state();
-        let now = 4_102_444_800;
-        let token = encode(
-            &Header::new(jsonwebtoken::Algorithm::RS256),
-            &SourceTokenClaims {
-                sub: "system:serviceaccount:idelephant:idelephant",
-                iss: "https://kubernetes.default.svc",
-                aud: "idmouse",
-                exp: now + 60,
-                nbf: now - 60,
-                iat: now - 60,
-            },
-            &EncodingKey::from_rsa_pem(SOURCE_PRIVATE_KEY.as_bytes()).unwrap(),
-        )
-        .unwrap();
+        let token = source_token("system:serviceaccount:idelephant:idelephant");
 
-        let subject = state.subject_validator.validate(Some(&token)).unwrap();
-        let claims = state
-            .mapping_resolver
-            .resolve("idelephant", &subject)
+        let source_subject = state
+            .subject_validator
+            .validate(Some("idelephant-source"), Some(&token))
             .unwrap();
+        assert_eq!(
+            source_subject,
+            "system:serviceaccount:idelephant:idelephant"
+        );
+        let claims = state.mapping_resolver.resolve("idelephant").unwrap();
         let access_token = state.token_builder.build(&finalize_claims(claims)).unwrap();
         let mut validation = Validation::new(jsonwebtoken::Algorithm::ES256);
         validation.set_issuer(&["http://idmouse.idmouse.svc"]);
@@ -305,6 +302,23 @@ additional_claims = {{ ns = "default", db = "idelephant", sub = "idelephant", ac
         )
         .unwrap();
         assert_eq!(decoded.claims["sub"], json!("idelephant"));
+    }
+
+    #[test]
+    fn rejects_source_token_that_cannot_assume_mapping_role() {
+        let state = test_state();
+        let token = source_token("system:serviceaccount:default:default");
+
+        let error = state
+            .subject_validator
+            .validate(Some("idelephant-source"), Some(&token))
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            crate::error::AppError::Unauthorized(message)
+                if message == "source token cannot assume role 'idelephant-source'"
+        ));
     }
 
     #[test]
@@ -330,13 +344,10 @@ additional_claims = { sub = "open-access" }
         config.validate(true).unwrap();
         let state = build_app_state(&config, true).unwrap();
 
-        let subject = state.subject_validator.validate(None).unwrap();
-        assert_eq!(subject, "unauthenticated");
+        let source_subject = state.subject_validator.validate(None, None).unwrap();
+        assert_eq!(source_subject, "unauthenticated");
 
-        let claims = state
-            .mapping_resolver
-            .resolve("open-access", &subject)
-            .unwrap();
+        let claims = state.mapping_resolver.resolve("open-access").unwrap();
         assert_eq!(claims["iss"], json!("http://idmouse.idmouse.svc"));
         assert_eq!(claims["sub"], json!("open-access"));
     }

@@ -5,7 +5,7 @@ new JWT selected by a named mapping.
 
 The config defines:
 
-- how incoming bearer tokens should be authenticated when auth is enabled
+- which roles incoming bearer tokens may assume when auth is enabled
 - how issued token signing keys are stored and rotated
 - a list of named mappings
 
@@ -14,21 +14,21 @@ The config defines:
 1. Call `POST /token/<mapping-name>`.
    Optionally add `?ttl=<seconds>` to request a shorter-lived token.
    When auth is enabled, include an `Authorization: Bearer ...` header.
-2. `idmouse` validates the incoming token using the configured authentication issuer, audience, and
-   validation key when one is configured.
-   If `validation_key` is omitted, `idmouse` fetches
+2. `idmouse` finds the named mapping and validates the incoming token against the mapping's
+   configured role. The role defines issuer, audience, accepted algorithms, and required claims.
+   If `validation_key` is omitted from the role, `idmouse` fetches
    `<issuer>/.well-known/openid-configuration`, reads `jwks_uri`, and then discovers a matching
    verification key from that JWKS document.
    For the exact issuer `https://kubernetes.default.svc`, discovery also uses the service account
    CA bundle and bearer token from `/var/run/secrets/kubernetes.io/serviceaccount/` when those
    files exist.
-3. The incoming token subject must be present in the mapping’s `allowed_subjects`.
+3. The incoming token must satisfy the role's claim requirements.
 4. `idmouse` issues a new JWT containing standard timing claims plus the mapping’s
    `additional_claims`.
 
 When started with `--disable-auth`, `idmouse` skips source token validation entirely. In that
-mode, callers do not need to send an `Authorization` header, `allowed_subjects` is not enforced,
-and the `[authentication]` config section may be omitted.
+mode, callers do not need to send an `Authorization` header, mapping roles are not enforced,
+and `[[role]]` config entries may be omitted.
 
 ## Example config
 
@@ -37,10 +37,11 @@ bind_address = "0.0.0.0:8080"
 origin = "http://idmouse.idmouse.svc"
 signing_key_storage = "in_memory"
 
-[authentication]
+[[role]]
+name = "idelephant-source"
 audience = "idmouse"
 issuer = "https://kubernetes.default.svc"
-validation_key = """
+validation-key = """
 -----BEGIN PUBLIC KEY-----
 MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAoTljJr11MDnf6FGOXi07
 EUqrmLKrT/9tPEJd98zYCP+3oUaqvDDnq72wSWmwmztjxun4O4kotsuExhitnVQ5
@@ -52,8 +53,19 @@ HwIDAQAB
 -----END PUBLIC KEY-----
 """
 
-# Optional. If omitted, idmouse will attempt OpenID Connect discovery via
-# <issuer>/.well-known/openid-configuration and use the returned jwks_uri.
+[role.claims]
+sub = "system:serviceaccount:idelephant:idelephant"
+
+[[role]]
+name = "default-source"
+audience = "idmouse"
+issuer = "https://kubernetes.default.svc"
+
+[role.claims]
+sub = "system:serviceaccount:default:default"
+
+# Optional. If role.validation-key is omitted, idmouse will attempt OpenID Connect
+# discovery via <issuer>/.well-known/openid-configuration and use the returned jwks_uri.
 # Optional. One of "in_memory" or "kubernetes_secret".
 # "in_memory" is the default and generates a fresh signing key on startup.
 # "kubernetes_secret" stores rotated signing keys in the local-namespace Secret
@@ -61,12 +73,12 @@ HwIDAQAB
 
 [[mapping]]
 name = "idelephant"
-allowed_subjects = ["system:serviceaccount:idelephant:idelephant"]
+role = "idelephant-source"
 additional_claims = { ns = "default", db = "idelephant", sub = "idelephant", ac = "token_name", id = "idelephant" }
 
 [[mapping]]
 name = "some_other_mapping"
-allowed_subjects = ["system:serviceaccount:default:default"]
+role = "default-source"
 additional_claims = { ns = "ns_name", db = "foo" }
 ```
 

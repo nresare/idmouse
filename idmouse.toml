@@ -1,11 +1,12 @@
 bind_address = "0.0.0.0:8080"
 origin = "http://idmouse.idmouse.svc"
 
-# This section is required unless the service is started with --disable-auth.
-[authentication]
+# Roles are required unless the service is started with --disable-auth.
+[[role]]
+name = "idelephant-source"
 audience = "idmouse"
 issuer = "https://kubernetes.default.svc"
-validation_key = """
+validation-key = """
 -----BEGIN PUBLIC KEY-----
 MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAoTljJr11MDnf6FGOXi07
 EUqrmLKrT/9tPEJd98zYCP+3oUaqvDDnq72wSWmwmztjxun4O4kotsuExhitnVQ5
@@ -17,16 +18,28 @@ HwIDAQAB
 -----END PUBLIC KEY-----
 """
 
+[role.claims]
+sub = "system:serviceaccount:idelephant:idelephant"
+
+[[role]]
+name = "default-source"
+audience = "idmouse"
+issuer = "https://kubernetes.default.svc"
+
+[role.claims]
+sub = "system:serviceaccount:default:default"
+
 [[mapping]]
 name = "idelephant"
-allowed_subjects = ["system:serviceaccount:idelephant:idelephant"]
+role = "idelephant-source"
 additional_claims = { ns = "default", db = "idelephant", sub = "idelephant", ac = "idelephant", rl = ["Editor"] }
 
 [[mapping]]
 name = "some_other_mapping"
-allowed_subjects = ["system:serviceaccount:default:default"]
+role = "default-source"
 additional_claims = { ns = "ns_name", db = "foo" }
 
 [[mapping]]
 name = "root"
+role = "default-source"
 additional_claims = { ac = "root", rl = ["Owner"] }

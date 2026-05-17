@@ -1,4 +1,3 @@
-use crate::auth;
 use anyhow::Context;
 use serde::Deserialize;
 use serde_json::{Map, Value};
@@ -10,8 +9,8 @@ pub struct Config {
     pub origin: String,
     #[serde(default = "default_signing_key_storage")]
     pub signing_key_storage: SigningKeyStorage,
-    #[serde(default)]
-    pub authentication: AuthenticationConfig,
+    #[serde(rename = "role", default)]
+    pub roles: Vec<authzoo::RoleConfig>,
     #[serde(rename = "mapping", default)]
     pub mappings: Vec<MappingConfig>,
 }
@@ -23,22 +22,10 @@ pub enum SigningKeyStorage {
     KubernetesSecret,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct AuthenticationConfig {
-    #[serde(default)]
-    pub audience: String,
-    #[serde(default)]
-    pub issuer: String,
-    pub validation_key: Option<String>,
-    #[serde(default = "default_authentication_algorithm")]
-    pub algorithm: String,
-}
-
 #[derive(Debug, Clone, Deserialize)]
 pub struct MappingConfig {
     pub name: String,
-    #[serde(default)]
-    pub allowed_subjects: Vec<String>,
+    pub role: Option<String>,
     #[serde(default)]
     pub additional_claims: Map<String, Value>,
 }
@@ -59,48 +46,36 @@ impl Config {
             anyhow::bail!("at least one [[mapping]] entry is required");
         }
 
+        let role_validator = authzoo::TokenValidator::new(self.roles.clone())?;
+        if !disable_auth && self.roles.is_empty() {
+            anyhow::bail!("at least one [[role]] entry is required");
+        }
+
         let mut names = std::collections::HashSet::new();
         for mapping in &self.mappings {
             if mapping.name.is_empty() {
                 anyhow::bail!("mapping names must not be empty");
             }
-            if !disable_auth && mapping.allowed_subjects.is_empty() {
-                anyhow::bail!(
-                    "mapping '{}' must define at least one allowed_subject",
-                    mapping.name
-                );
+            if !disable_auth {
+                let role = mapping.role.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("mapping '{}' must define role", mapping.name)
+                })?;
+                if role.is_empty() {
+                    anyhow::bail!("mapping '{}' role must not be empty", mapping.name);
+                }
+                role_validator.ensure_roles_exist([role])?;
             }
             if !names.insert(mapping.name.clone()) {
                 anyhow::bail!("duplicate mapping name '{}'", mapping.name);
             }
         }
 
-        if !disable_auth {
-            self.authentication.validate()?;
-        }
-        Ok(())
-    }
-}
-
-impl AuthenticationConfig {
-    pub fn validate(&self) -> anyhow::Result<()> {
-        if self.audience.is_empty() {
-            anyhow::bail!("authentication.audience must not be empty");
-        }
-        if self.issuer.is_empty() {
-            anyhow::bail!("authentication.issuer must not be empty");
-        }
-        auth::algorithm(self)?;
         Ok(())
     }
 }
 
 fn default_bind_address() -> String {
     "0.0.0.0:8080".to_string()
-}
-
-fn default_authentication_algorithm() -> String {
-    "RS256".to_string()
 }
 
 fn default_signing_key_storage() -> SigningKeyStorage {
