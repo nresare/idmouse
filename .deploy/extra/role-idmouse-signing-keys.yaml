@@ -1,0 +1,9 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: idmouse-signing-keys
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["idmouse-signing-keys"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
