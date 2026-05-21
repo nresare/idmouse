@@ -1,0 +1,34 @@
+bind_address = "0.0.0.0:8080"
+origin = "http://idmouse.idmouse.svc"
+signing_key_storage = "kubernetes_secret"
+
+[authentication]
+audience = "idmouse"
+issuer = "https://k8s.noa.re"
+
+[[mapping]]
+name = "idelephant"
+allowed_subjects = ["system:serviceaccount:idelephant:default"]
+[mapping.additional_claims]
+ns = "default"
+db = "idelephant"
+ac = "idelephant"
+rl = ["Editor"]
+
+[[mapping]]
+name = "reposnake"
+allowed_subjects = ["system:serviceaccount:reposnake:default"]
+[mapping.additional_claims]
+ns = "default"
+db = "reposnake"
+ac = "reposnake"
+rl = ["Editor"]
+
+[[mapping]]
+name = "relcoord"
+allowed_subjects = ["system:serviceaccount:relcoord:default"]
+[mapping.additional_claims]
+ns = "default"
+db = "relcoord"
+ac = "relcoord"
+rl = ["Editor"]

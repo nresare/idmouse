@@ -1,0 +1,5 @@
+[[simple]]
+namespace = "idmouse"
+extra-resources = "extra"
+k8s-role = "idmouse-signing-keys"
+config = {"/config/idmouse.toml" = "idmouse.toml"}
