@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 anyhow = "1.0"
 axum = "0.8"
-base64 = "0.22"
+base64 = "0.23"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 clap = { version = "4.6", features = ["derive"] }
 jsonwebtoken = { version = "10.3", features = ["rust_crypto"] }
@@ -16,8 +16,8 @@ serde_json = "1.0"
 thiserror = "2.0"
 tokio = { version = "1.51", features = ["macros", "rt-multi-thread", "net"] }
 toml = "1.0"
-tower-http = { version = "0.6", features = ["trace"] }
+tower-http = { version = "0.7", features = ["trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
-sha2 = "0.10"
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "default-tls"] }
+sha2 = "0.11"
