@@ -16,7 +16,7 @@ The config defines:
    When auth is enabled, include an `Authorization: Bearer ...` header.
 2. `idmouse` finds the named mapping and validates the incoming token against the mapping's
    configured role. The role defines issuer, audience, accepted algorithms, and required claims.
-   If `validation_key` is omitted from the role, `idmouse` fetches
+   If `validation-key` is omitted from the role, `idmouse` fetches
    `<issuer>/.well-known/openid-configuration`, reads `jwks_uri`, and then discovers a matching
    verification key from that JWKS document.
    For the exact issuer `https://kubernetes.default.svc`, discovery also uses the service account
