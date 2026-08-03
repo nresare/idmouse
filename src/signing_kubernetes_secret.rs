@@ -6,7 +6,7 @@ use base64::engine::general_purpose::STANDARD as B64_STANDARD;
 use base64::Engine;
 use chrono::{DateTime, Datelike, Duration, TimeZone, Timelike, Utc};
 use p256::ecdsa::SigningKey;
-use p256::elliptic_curve::rand_core::OsRng;
+use p256::elliptic_curve::Generate;
 use p256::pkcs8::{DecodePrivateKey, EncodePrivateKey, LineEnding};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
@@ -252,7 +252,7 @@ fn ensure_key_for_slot(
         return Ok(());
     }
 
-    let signing_key = SigningKey::random(&mut OsRng);
+    let signing_key = SigningKey::generate();
     let private_key_pem = signing_key
         .to_pkcs8_pem(LineEnding::LF)
         .context("failed to encode rotated ES256 private key")?;

@@ -223,7 +223,8 @@ additional_claims = {{ ns = "default", db = "idelephant", sub = "idelephant", ac
             .next()
             .unwrap();
         let key = jsonwebtoken::DecodingKey::from_ec_components(&jwk.x, &jwk.y).unwrap();
-        let pem = p256::ecdsa::VerifyingKey::from_sec1_bytes(key.as_bytes()).unwrap();
+        let pem =
+            p256::ecdsa::VerifyingKey::from_sec1_bytes(key.try_get_as_bytes().unwrap()).unwrap();
         pem.to_public_key_pem(p256::pkcs8::LineEnding::LF).unwrap()
     }
 
