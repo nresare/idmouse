@@ -81,3 +81,18 @@ fn default_bind_address() -> String {
 fn default_signing_key_storage() -> SigningKeyStorage {
     SigningKeyStorage::InMemory
 }
+
+#[cfg(test)]
+mod tests {
+    use super::Config;
+
+    #[test]
+    fn deployment_config_is_valid() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/.deploy/idmouse.toml");
+        let config = Config::load(path).expect("deployment config should parse");
+
+        config
+            .validate(false)
+            .expect("deployment config should be valid with authentication enabled");
+    }
+}
