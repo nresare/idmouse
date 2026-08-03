@@ -22,7 +22,7 @@ pub struct Jwk {
 
 pub(crate) fn kid_for_signing_key(signing_key: &SigningKey) -> String {
     let verifying_key = VerifyingKey::from(signing_key);
-    let encoded = verifying_key.to_encoded_point(true);
+    let encoded = verifying_key.to_sec1_point(true);
     let digest = Sha256::digest(encoded.as_bytes());
     B64_URL_SAFE_NO_PAD.encode(&digest[..6])
 }
@@ -46,7 +46,7 @@ pub(crate) fn build_token(
 
 pub(crate) fn jwk_for_signing_key(signing_key: &SigningKey) -> Jwk {
     let verifying_key = VerifyingKey::from(signing_key);
-    let encoded = verifying_key.to_encoded_point(false);
+    let encoded = verifying_key.to_sec1_point(false);
     let x = B64_URL_SAFE_NO_PAD.encode(
         encoded
             .x()
@@ -76,11 +76,11 @@ mod tests {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64_URL_SAFE_NO_PAD;
     use base64::Engine;
     use p256::ecdsa::{SigningKey, VerifyingKey};
-    use p256::elliptic_curve::rand_core::OsRng;
+    use p256::elliptic_curve::Generate;
 
     #[test]
     fn kid_is_stable_for_same_signing_key() {
-        let signing_key = SigningKey::random(&mut OsRng);
+        let signing_key = SigningKey::generate();
 
         assert_eq!(
             kid_for_signing_key(&signing_key),
@@ -90,24 +90,24 @@ mod tests {
 
     #[test]
     fn kid_differs_for_different_signing_keys() {
-        let first = SigningKey::random(&mut OsRng);
-        let second = SigningKey::random(&mut OsRng);
+        let first = SigningKey::generate();
+        let second = SigningKey::generate();
 
         assert_ne!(kid_for_signing_key(&first), kid_for_signing_key(&second));
     }
 
     #[test]
     fn kid_has_expected_short_encoded_length() {
-        let signing_key = SigningKey::random(&mut OsRng);
+        let signing_key = SigningKey::generate();
 
         assert_eq!(kid_for_signing_key(&signing_key).len(), 8);
     }
 
     #[test]
     fn jwk_contains_expected_metadata_and_coordinates() -> Result<()> {
-        let signing_key = SigningKey::random(&mut OsRng);
+        let signing_key = SigningKey::generate();
         let verifying_key = VerifyingKey::from(&signing_key);
-        let encoded = verifying_key.to_encoded_point(false);
+        let encoded = verifying_key.to_sec1_point(false);
         let jwk = jwk_for_signing_key(&signing_key);
 
         assert_eq!(jwk.kty, "EC");
@@ -122,13 +122,13 @@ mod tests {
 
     #[test]
     fn jwk_round_trips_into_jsonwebtoken_decoding_key() -> Result<()> {
-        let signing_key = SigningKey::random(&mut OsRng);
+        let signing_key = SigningKey::generate();
         let jwk = jwk_for_signing_key(&signing_key);
         let decoding_key = jsonwebtoken::DecodingKey::from_ec_components(&jwk.x, &jwk.y)?;
 
-        let expected = VerifyingKey::from(&signing_key).to_encoded_point(false);
+        let expected = VerifyingKey::from(&signing_key).to_sec1_point(false);
 
-        assert_eq!(decoding_key.as_bytes(), expected.as_bytes());
+        assert_eq!(decoding_key.try_get_as_bytes()?, expected.as_bytes());
         Ok(())
     }
 }

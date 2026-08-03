@@ -4,7 +4,7 @@ use crate::signing_kubernetes_secret::KubernetesSecretTokenBuilder;
 use crate::{jwt, kubernetes};
 use anyhow::{Context, Result};
 use p256::ecdsa::SigningKey;
-use p256::elliptic_curve::rand_core::OsRng;
+use p256::elliptic_curve::Generate;
 use reqwest::blocking::Client;
 use serde_json::{Map, Value};
 use std::sync::Arc;
@@ -25,7 +25,7 @@ pub(crate) struct InMemoryTokenBuilder {
 impl InMemoryTokenBuilder {
     pub fn new() -> Self {
         Self {
-            signing_key: SigningKey::random(&mut OsRng),
+            signing_key: SigningKey::generate(),
         }
     }
 }
@@ -70,12 +70,12 @@ mod tests {
     use anyhow::Result;
     use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
     use p256::ecdsa::SigningKey;
-    use p256::elliptic_curve::rand_core::OsRng;
+    use p256::elliptic_curve::Generate;
     use serde_json::{json, Map, Value};
 
     #[test]
     fn in_memory_builder_builds_es256_token_with_matching_kid() -> Result<()> {
-        let signing_key = SigningKey::random(&mut OsRng);
+        let signing_key = SigningKey::generate();
         let builder = InMemoryTokenBuilder {
             signing_key: signing_key.clone(),
         };
@@ -94,7 +94,7 @@ mod tests {
     #[test]
     fn in_memory_builder_emits_jwks_that_validates_issued_tokens() -> Result<()> {
         let builder = InMemoryTokenBuilder {
-            signing_key: SigningKey::random(&mut OsRng),
+            signing_key: SigningKey::generate(),
         };
         let claims = sample_claims();
         let token = builder.build(&claims)?;
@@ -120,7 +120,7 @@ mod tests {
 
     #[test]
     fn jwks_is_derived_from_signing_key_coordinates() {
-        let signing_key = SigningKey::random(&mut OsRng);
+        let signing_key = SigningKey::generate();
         let expected = jwk_for_signing_key(&signing_key);
 
         assert_eq!(expected.alg, "ES256");
@@ -134,7 +134,7 @@ mod tests {
 
     #[test]
     fn build_token_preserves_all_supplied_claims() -> Result<()> {
-        let signing_key = SigningKey::random(&mut OsRng);
+        let signing_key = SigningKey::generate();
         let claims = sample_claims();
 
         let token = build_token(&signing_key, &claims)?;
