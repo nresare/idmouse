@@ -7,12 +7,18 @@ pub struct Config {
     #[serde(default = "default_bind_address")]
     pub bind_address: String,
     pub origin: String,
+    pub tracing: Option<TracingConfig>,
     #[serde(default = "default_signing_key_storage")]
     pub signing_key_storage: SigningKeyStorage,
     #[serde(rename = "role", default)]
     pub roles: Vec<authzoo::RoleConfig>,
     #[serde(rename = "mapping", default)]
     pub mappings: Vec<MappingConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TracingConfig {
+    pub endpoint: String,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -39,6 +45,13 @@ impl Config {
     }
 
     pub fn validate(&self, disable_auth: bool) -> anyhow::Result<()> {
+        if let Some(tracing) = &self.tracing {
+            let endpoint = reqwest::Url::parse(&tracing.endpoint)
+                .context("tracing.endpoint must be an absolute HTTP or HTTPS URL")?;
+            if !matches!(endpoint.scheme(), "http" | "https") || endpoint.host_str().is_none() {
+                anyhow::bail!("tracing.endpoint must be an absolute HTTP or HTTPS URL");
+            }
+        }
         if self.origin.is_empty() {
             anyhow::bail!("origin must not be empty");
         }
@@ -85,6 +98,37 @@ fn default_signing_key_storage() -> SigningKeyStorage {
 #[cfg(test)]
 mod tests {
     use super::Config;
+
+    #[test]
+    fn tracing_config_is_optional_and_requires_an_endpoint() {
+        let base = r#"
+origin = "http://idmouse"
+[[mapping]]
+name = "open"
+"#;
+        let config: Config = toml::from_str(base).unwrap();
+        assert!(config.tracing.is_none());
+        config.validate(true).unwrap();
+        let configured: Config = toml::from_str(&format!(
+            "{base}\n[tracing]\nendpoint = \"http://tempo:4317\""
+        ))
+        .unwrap();
+        assert_eq!(
+            configured.tracing.as_ref().unwrap().endpoint,
+            "http://tempo:4317"
+        );
+        configured.validate(true).unwrap();
+        assert!(toml::from_str::<Config>(&format!("{base}\n[tracing]")).is_err());
+        for endpoint in ["", "tempo:4317", "ftp://tempo:4317"] {
+            let mut config = configured.clone();
+            config.tracing.as_mut().unwrap().endpoint = endpoint.to_string();
+            assert!(config
+                .validate(true)
+                .unwrap_err()
+                .to_string()
+                .contains("tracing.endpoint"));
+        }
+    }
 
     #[test]
     fn deployment_config_is_valid() {
