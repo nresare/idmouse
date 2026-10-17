@@ -30,6 +30,21 @@ When started with `--disable-auth`, `idmouse` skips source token validation enti
 mode, callers do not need to send an `Authorization` header, mapping roles are not enforced,
 and `[[role]]` config entries may be omitted.
 
+## Distributed tracing
+
+To export request traces to an OTLP gRPC receiver such as Tempo, add:
+
+```toml
+[tracing]
+endpoint = "http://tempo:4317"
+```
+
+Omit this block to keep console logging without exporting traces. Traces use the
+service name `idmouse`, include diagnostic events from `authzoo`, and continue
+incoming W3C `traceparent`/`tracestate` context. The endpoint must point to the OTLP
+gRPC receiver, not Tempo's query API or OTLP HTTP port. Buffered spans are flushed
+when the service shuts down on SIGTERM or Ctrl-C.
+
 ## Example config
 
 ```toml

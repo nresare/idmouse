@@ -5,6 +5,7 @@ mod kubernetes;
 mod service;
 mod signing;
 mod signing_kubernetes_secret;
+mod telemetry;
 
 use crate::config::Config;
 use crate::error::AppError;
@@ -20,12 +21,8 @@ use serde::Serialize;
 use serde_json::{json, Map, Value};
 use std::net::SocketAddr;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tower_http::trace::{self, TraceLayer};
-use tracing::Level;
+use tower_http::trace::TraceLayer;
 use tracing::{error, info};
-use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::EnvFilter;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -44,25 +41,21 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::registry()
-        .with(EnvFilter::new(
-            "idmouse=debug,tower_http=info,axum::rejection=trace",
-        ))
-        .with(tracing_subscriber::fmt::layer().compact())
-        .init();
-
-    if let Err(error) = run().await {
-        error!("{error:#}");
-        std::process::exit(1);
-    }
-
-    Ok(())
-}
-
-async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let config = Config::load(&cli.config_path)?;
     config.validate(cli.disable_auth)?;
+    let provider = telemetry::init(config.tracing.as_ref())?;
+    let result = run(cli, config).await;
+    if let Err(error) = &result {
+        error!("{error:#}");
+    }
+    if let Some(provider) = provider {
+        tokio::task::spawn_blocking(move || provider.shutdown()).await??;
+    }
+    result
+}
+
+async fn run(cli: Cli, config: Config) -> anyhow::Result<()> {
     let bind_address: SocketAddr = config.bind_address.parse()?;
 
     info!(
@@ -80,14 +73,16 @@ async fn run() -> anyhow::Result<()> {
         .route("/.well-known/jwks.json", get(jwks_handler))
         .layer(
             TraceLayer::new_for_http()
-                .make_span_with(trace::DefaultMakeSpan::new().level(Level::INFO))
-                .on_response(trace::DefaultOnResponse::new().level(Level::INFO)),
+                .make_span_with(telemetry::request_span)
+                .on_response(telemetry::response),
         )
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(bind_address).await?;
     info!(address = %bind_address, "listening");
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(telemetry::shutdown_signal())
+        .await?;
     Ok(())
 }
 
