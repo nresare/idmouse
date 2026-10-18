@@ -2,6 +2,9 @@ bind_address = "0.0.0.0:8080"
 origin = "http://idmouse.idmouse.svc"
 signing_key_storage = "kubernetes_secret"
 
+[tracing]
+endpoint = "http://tempo.tempo.svc:4317"
+
 [[role]]
 name = "idelephant-source"
 audience = "idmouse"
